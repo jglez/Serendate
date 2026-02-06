@@ -1,0 +1,20 @@
+{
+  "expo": {
+    "name": "Serendate",
+    "slug": "serendate",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.serendate.app"
+    },
+    "android": {
+      "package": "com.serendate.app"
+    },
+    "plugins": [
+      "expo-asset"
+    ]
+  }
+}
