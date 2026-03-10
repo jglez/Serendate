@@ -113,7 +113,7 @@ const LIMITED_EVENT = {
   neighborhood: "Mission",
   time: "6:00 PM - 10:00 PM",
   blurb: "Pop-up galleries, live jazz, and late-night food stalls.",
-  weatherFit: "rain" as WeatherMode
+  indoor: false
 };
 
 const IDEAS: DateIdea[] = [
@@ -287,7 +287,7 @@ function buildItinerary(
   budget: BudgetTier,
   maxMinutes: number,
   seed: number,
-  includeWeatherEvent: boolean
+  includeLocalEvent: boolean
 ): PlanStop[] {
   const fitsBudget = ideas.filter((idea) => BUDGET_RANK[idea.cost] <= BUDGET_RANK[budget]);
   const pool = fitsBudget.length > 0 ? fitsBudget : ideas;
@@ -327,7 +327,7 @@ function buildItinerary(
     }
   }
 
-  if (includeWeatherEvent && remaining >= 50) {
+  if (includeLocalEvent && remaining >= 50) {
     const eventStart = clock;
     const eventEnd = eventStart + 60;
 
@@ -360,16 +360,21 @@ function animatedStyle(value: Animated.Value) {
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("Discover");
+  const [pendingTab, setPendingTab] = useState<TabKey | null>(null);
   const [selectedVibe, setSelectedVibe] = useState<Vibe>("Cozy");
   const [selectedBudget, setSelectedBudget] = useState<BudgetTier>("$$");
   const [selectedTime, setSelectedTime] = useState<TimeKey>("standard");
-  const [weatherSmart, setWeatherSmart] = useState(true);
+  const [preferOutdoor, setPreferOutdoor] = useState(false);
   const [locationFilterMode, setLocationFilterMode] = useState<LocationFilterMode>("radius");
   const [selectedRadiusMiles, setSelectedRadiusMiles] = useState(3.5);
   const [selectedNeighborhood, setSelectedNeighborhood] = useState("All");
   const [savedIds, setSavedIds] = useState<string[]>(["vinyl-wine", "night-museum"]);
   const [planSeed, setPlanSeed] = useState(0);
 
+  const scrollViewRef = useRef<ScrollView>(null);
+  const tabSectionTopRef = useRef<number | null>(null);
+  const currentScrollYRef = useRef(0);
+  const tabSwitchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const animatedValues = useRef(Array.from({ length: 16 }, () => new Animated.Value(0))).current;
 
   const neighborhoods = useMemo(
@@ -383,25 +388,21 @@ export default function App() {
         locationFilterMode === "radius"
           ? idea.distanceMiles <= selectedRadiusMiles
           : selectedNeighborhood === "All" || idea.neighborhood === selectedNeighborhood;
+      const environmentMatch = preferOutdoor ? !idea.indoor : idea.indoor;
       const budgetMatch = BUDGET_RANK[idea.cost] <= BUDGET_RANK[selectedBudget];
       const vibeMatch = idea.vibes.includes(selectedVibe);
       const durationMatch = idea.durationMinutes <= TIME_OPTIONS[selectedTime].maxMinutes;
-      const weatherMatch =
-        !weatherSmart ||
-        idea.weatherFit === "any" ||
-        idea.weatherFit === WEATHER.condition ||
-        idea.indoor;
 
-      return locationMatch && budgetMatch && vibeMatch && durationMatch && weatherMatch;
+      return locationMatch && environmentMatch && budgetMatch && vibeMatch && durationMatch;
     }).sort((a, b) => a.distanceMiles - b.distanceMiles);
   }, [
     locationFilterMode,
     selectedNeighborhood,
     selectedRadiusMiles,
+    preferOutdoor,
     selectedBudget,
     selectedVibe,
-    selectedTime,
-    weatherSmart
+    selectedTime
   ]);
 
   const discoverIdeas = useMemo(() => filteredIdeas.slice(0, 6), [filteredIdeas]);
@@ -418,10 +419,9 @@ export default function App() {
         selectedBudget,
         TIME_OPTIONS[selectedTime].maxMinutes,
         planSeed,
-        weatherSmart &&
-          (LIMITED_EVENT.weatherFit === "any" || WEATHER.condition === LIMITED_EVENT.weatherFit)
+        preferOutdoor ? !LIMITED_EVENT.indoor : LIMITED_EVENT.indoor
       ),
-    [filteredIdeas, selectedBudget, selectedTime, planSeed, weatherSmart]
+    [filteredIdeas, selectedBudget, selectedTime, planSeed, preferOutdoor]
   );
 
   useEffect(() => {
@@ -455,6 +455,55 @@ export default function App() {
     );
   };
 
+  const handleTabChange = (tab: TabKey) => {
+    const isAlreadyShown = pendingTab === null && tab === activeTab;
+    if (isAlreadyShown) {
+      return;
+    }
+
+    if (tabSwitchTimeoutRef.current !== null) {
+      clearTimeout(tabSwitchTimeoutRef.current);
+      tabSwitchTimeoutRef.current = null;
+    }
+
+    setPendingTab(tab);
+
+    const targetY = tabSectionTopRef.current !== null ? Math.max(tabSectionTopRef.current - 12, 0) : 0;
+    const shouldDelayContentSwap = currentScrollYRef.current > targetY + 20;
+
+    const applyTab = () => {
+      setActiveTab(tab);
+      setPendingTab(null);
+      tabSwitchTimeoutRef.current = null;
+    };
+
+    if (tabSectionTopRef.current !== null) {
+      scrollViewRef.current?.scrollTo({
+        y: targetY,
+        animated: true
+      });
+    }
+
+    if (shouldDelayContentSwap) {
+      tabSwitchTimeoutRef.current = setTimeout(() => {
+        applyTab();
+      }, 280);
+      return;
+    }
+
+    applyTab();
+  };
+
+  useEffect(() => {
+    return () => {
+      if (tabSwitchTimeoutRef.current !== null) {
+        clearTimeout(tabSwitchTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const selectedTab = pendingTab ?? activeTab;
+
   const WeatherHeader = (
     <View style={styles.infoRow}>
       <LinearGradient colors={[PALETTE.mint, "#A7DCCF"]} style={styles.infoCard}>
@@ -482,15 +531,19 @@ export default function App() {
       <View style={styles.sectionHeaderWrap}>
         <Text style={styles.sectionTitle}>Date Controls</Text>
         <View style={styles.switchRow}>
-          <Text style={styles.switchLabel}>Weather-smart</Text>
+          <Text style={[styles.switchLabel, !preferOutdoor && styles.switchLabelActive]}>Indoor</Text>
           <Switch
-            value={weatherSmart}
-            onValueChange={setWeatherSmart}
+            value={preferOutdoor}
+            onValueChange={setPreferOutdoor}
             trackColor={{ false: "#C4CBD4", true: "#72C8B6" }}
-            thumbColor={weatherSmart ? "#FAFCFE" : "#EEF1F5"}
+            thumbColor={preferOutdoor ? "#FAFCFE" : "#EEF1F5"}
           />
+          <Text style={[styles.switchLabel, preferOutdoor && styles.switchLabelActive]}>Outdoor</Text>
         </View>
       </View>
+      <Text style={styles.switchHelpText}>
+        {preferOutdoor ? "Showing outdoor date ideas" : "Showing indoor date ideas"}
+      </Text>
 
       <Text style={styles.controlLabel}>Location Filter</Text>
       <View style={styles.locationModeRow}>
@@ -611,7 +664,7 @@ export default function App() {
 
   const DiscoverTab = (
     <View style={styles.tabBody}>
-      <Text style={styles.tabIntro}>Fresh ideas nearby, tuned to your mood, budget, and forecast.</Text>
+      <Text style={styles.tabIntro}>Fresh ideas nearby, tuned to your mood, budget, and setting.</Text>
       {discoverIdeas.length === 0 ? (
         <Animated.View style={[styles.emptyState, animatedStyle(animatedValues[0])]}>
           <Ionicons name="search-outline" size={26} color={PALETTE.deep} />
@@ -746,7 +799,15 @@ export default function App() {
     <SafeAreaProvider>
       <SafeAreaView edges={["top"]} style={styles.safeArea}>
         <LinearGradient colors={[PALETTE.night, PALETTE.deep, PALETTE.slate]} style={styles.gradientBg}>
-          <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+          <ScrollView
+            ref={scrollViewRef}
+            contentContainerStyle={styles.scrollContent}
+            showsVerticalScrollIndicator={false}
+            onScroll={(event) => {
+              currentScrollYRef.current = event.nativeEvent.contentOffset.y;
+            }}
+            scrollEventThrottle={16}
+          >
             <View style={styles.container}>
               <View style={styles.heroRow}>
                 <View>
@@ -761,28 +822,33 @@ export default function App() {
 
               {WeatherHeader}
 
-              <View style={styles.tabRow}>
-                {TABS.map((tab) => {
-                  const selected = tab === activeTab;
-                  return (
-                    <Pressable
-                      key={tab}
-                      style={[styles.tabButton, selected && styles.tabButtonSelected]}
-                      onPress={() => setActiveTab(tab)}
-                    >
-                      <Text style={[styles.tabButtonText, selected && styles.tabButtonTextSelected]}>
-                        {tab}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-
               {Controls}
+              <View
+                onLayout={(event) => {
+                  tabSectionTopRef.current = event.nativeEvent.layout.y;
+                }}
+              >
+                <View style={styles.tabRow}>
+                  {TABS.map((tab) => {
+                    const selected = tab === selectedTab;
+                    return (
+                      <Pressable
+                        key={tab}
+                        style={[styles.tabButton, selected && styles.tabButtonSelected]}
+                        onPress={() => handleTabChange(tab)}
+                      >
+                        <Text style={[styles.tabButtonText, selected && styles.tabButtonTextSelected]}>
+                          {tab}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
 
-              {activeTab === "Discover" ? DiscoverTab : null}
-              {activeTab === "Plan" ? PlanTab : null}
-              {activeTab === "Saved" ? SavedTab : null}
+                {activeTab === "Discover" ? DiscoverTab : null}
+                {activeTab === "Plan" ? PlanTab : null}
+                {activeTab === "Saved" ? SavedTab : null}
+              </View>
             </View>
           </ScrollView>
         </LinearGradient>
@@ -859,12 +925,16 @@ const styles = StyleSheet.create({
   infoHead: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 6
+    gap: 6,
+    alignSelf: "stretch"
   },
   infoTitle: {
     fontSize: 12,
     color: PALETTE.ink,
-    fontFamily: FONT?.subtitle
+    fontFamily: FONT?.subtitle,
+    flex: 1,
+    flexWrap: "wrap",
+    flexShrink: 1
   },
   infoValue: {
     marginTop: 9,
@@ -932,6 +1002,16 @@ const styles = StyleSheet.create({
   switchLabel: {
     color: "rgba(247, 242, 233, 0.86)",
     fontSize: 12,
+    fontFamily: FONT?.body
+  },
+  switchLabelActive: {
+    color: PALETTE.cream,
+    fontFamily: FONT?.subtitle
+  },
+  switchHelpText: {
+    color: "rgba(247, 242, 233, 0.7)",
+    fontSize: 11,
+    marginBottom: 2,
     fontFamily: FONT?.body
   },
   controlLabel: {
