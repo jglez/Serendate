@@ -16,7 +16,7 @@ import Slider from "@react-native-community/slider";
 import DateTimePicker, { DateTimePickerEvent } from "@react-native-community/datetimepicker";
 
 type TabKey = "Discover" | "Plan" | "Saved";
-type BudgetTier = "$" | "$$" | "$$$";
+type BudgetTier = "Free" | "$" | "$$" | "$$$";
 type TimeKey = "quick" | "standard" | "linger";
 type LocationFilterMode = "radius" | "neighborhood";
 type ActivePicker = "none" | "date" | "time" | "datetime";
@@ -46,6 +46,11 @@ interface TimeOption {
   label: string;
   subLabel: string;
   maxMinutes: number;
+}
+
+interface BudgetOption {
+  title: string;
+  subtitle?: string;
 }
 
 interface PlanStop {
@@ -100,9 +105,26 @@ const MAX_PLANNING_DAYS_AHEAD = 120;
 const TIME_STEP_MINUTES = 5;
 
 const BUDGET_RANK: Record<BudgetTier, number> = {
+  Free: 0,
   "$": 1,
   "$$": 2,
   "$$$": 3
+};
+
+const BUDGET_TIERS: BudgetTier[] = ["Free", "$", "$$", "$$$"];
+
+const BUDGET_OPTIONS: Record<BudgetTier, BudgetOption> = {
+  Free: { title: "Free" },
+  "$": { title: "Low-key", subtitle: "Up to $50" },
+  "$$": { title: "Balanced", subtitle: "Up to $120" },
+  "$$$": { title: "Any budget" }
+};
+
+const IDEA_COST_LABELS: Record<BudgetTier, string> = {
+  Free: "Free",
+  "$": "Under $50",
+  "$$": "$50-$120",
+  "$$$": "$120+"
 };
 
 const LIMITED_EVENT = {
@@ -289,6 +311,42 @@ function formatDateLabel(date: Date): string {
   }).format(date);
 }
 
+function formatBudgetRange(tier: BudgetTier): string {
+  return IDEA_COST_LABELS[tier];
+}
+
+function formatBudgetSelection(tier: BudgetTier): string {
+  const option = BUDGET_OPTIONS[tier];
+  return option.subtitle ?? option.title;
+}
+
+function getRoundedNow(stepMinutes: number): Date {
+  const now = new Date();
+  now.setSeconds(0, 0);
+  const remainder = now.getMinutes() % stepMinutes;
+  if (remainder !== 0) {
+    now.setMinutes(now.getMinutes() + (stepMinutes - remainder));
+  }
+  return now;
+}
+
+function getMaxPlanningDate(minDate: Date): Date {
+  const maxDate = new Date(minDate);
+  maxDate.setHours(23, 59, 59, 999);
+  maxDate.setDate(maxDate.getDate() + MAX_PLANNING_DAYS_AHEAD);
+  return maxDate;
+}
+
+function clampDateTime(value: Date, minDate: Date, maxDate: Date): Date {
+  if (value.getTime() < minDate.getTime()) {
+    return new Date(minDate);
+  }
+  if (value.getTime() > maxDate.getTime()) {
+    return new Date(maxDate);
+  }
+  return value;
+}
+
 function buildItinerary(
   ideas: DateIdea[],
   budget: BudgetTier,
@@ -323,7 +381,9 @@ function buildItinerary(
       title: idea.title,
       venue: `${idea.venue} · ${idea.neighborhood}`,
       timeRange: `${formatClock(start)} - ${formatClock(end)}`,
-      note: `${idea.cost} · ${formatMinutes(idea.durationMinutes)} · ${idea.indoor ? "Indoor" : "Outdoor"}`,
+      note: `${formatBudgetRange(idea.cost)} · ${formatMinutes(idea.durationMinutes)} · ${
+        idea.indoor ? "Indoor" : "Outdoor"
+      }`,
       badge: idea.category
     });
 
@@ -373,7 +433,7 @@ export default function App() {
   const [selectedBudget, setSelectedBudget] = useState<BudgetTier>("$$");
   const [selectedTime, setSelectedTime] = useState<TimeKey>("standard");
   const [selectedDateTime, setSelectedDateTime] = useState<Date>(() => {
-    const now = new Date();
+    const now = getRoundedNow(TIME_STEP_MINUTES);
     const defaultDateTime = new Date(now);
     defaultDateTime.setHours(19, 0, 0, 0);
     if (defaultDateTime.getTime() <= now.getTime()) {
@@ -382,6 +442,7 @@ export default function App() {
     return defaultDateTime;
   });
   const [activePicker, setActivePicker] = useState<ActivePicker>("none");
+  const [minPlanningDate, setMinPlanningDate] = useState<Date>(() => getRoundedNow(TIME_STEP_MINUTES));
   const [preferOutdoor, setPreferOutdoor] = useState(false);
   const [locationFilterMode, setLocationFilterMode] = useState<LocationFilterMode>("radius");
   const [selectedRadiusMiles, setSelectedRadiusMiles] = useState(3.5);
@@ -441,18 +502,7 @@ export default function App() {
     [selectedDateTime]
   );
 
-  const maxPlanningDate = useMemo(() => {
-    const maxDate = new Date();
-    maxDate.setHours(23, 59, 59, 999);
-    maxDate.setDate(maxDate.getDate() + MAX_PLANNING_DAYS_AHEAD);
-    return maxDate;
-  }, []);
-
-  const minPlanningDate = useMemo(() => {
-    const minDate = new Date();
-    minDate.setSeconds(0, 0);
-    return minDate;
-  }, []);
+  const maxPlanningDate = useMemo(() => getMaxPlanningDate(minPlanningDate), [minPlanningDate]);
 
   const itinerary = useMemo(
     () =>
@@ -468,36 +518,19 @@ export default function App() {
   );
 
   const selectedDateLabel = formatDateLabel(selectedDate);
+  const selectedBudgetLabel = formatBudgetSelection(selectedBudget);
 
-  const applyWhenPreset = (preset: "tonight" | "tomorrow" | "weekend") => {
-    const now = new Date();
-    const next = new Date(selectedDateTime);
+  const syncPlanningBounds = () => {
+    const nextMin = getRoundedNow(TIME_STEP_MINUTES);
+    const nextMax = getMaxPlanningDate(nextMin);
+    setMinPlanningDate(nextMin);
+    setSelectedDateTime((current) => clampDateTime(current, nextMin, nextMax));
+    return { nextMin, nextMax };
+  };
 
-    if (preset === "tonight") {
-      next.setFullYear(now.getFullYear(), now.getMonth(), now.getDate());
-      next.setHours(19, 0, 0, 0);
-      if (next.getTime() <= now.getTime()) {
-        const rounded = new Date(now);
-        rounded.setSeconds(0, 0);
-        rounded.setMinutes(Math.ceil(rounded.getMinutes() / TIME_STEP_MINUTES) * TIME_STEP_MINUTES);
-        next.setTime(rounded.getTime());
-      }
-    } else if (preset === "tomorrow") {
-      next.setFullYear(now.getFullYear(), now.getMonth(), now.getDate() + 1);
-      next.setHours(19, 0, 0, 0);
-    } else {
-      const weekend = new Date(now);
-      const daysUntilSaturday = (6 - weekend.getDay() + 7) % 7;
-      weekend.setDate(weekend.getDate() + daysUntilSaturday);
-      weekend.setHours(19, 0, 0, 0);
-      if (weekend.getTime() <= now.getTime()) {
-        weekend.setDate(weekend.getDate() + 1);
-      }
-      next.setTime(weekend.getTime());
-    }
-
-    setSelectedDateTime(next);
-    setActivePicker("none");
+  const togglePicker = (picker: Exclude<ActivePicker, "none">) => {
+    syncPlanningBounds();
+    setActivePicker((current) => (current === picker ? "none" : picker));
   };
 
   const handleTimeChange = (_event: DateTimePickerEvent, value?: Date) => {
@@ -510,7 +543,7 @@ export default function App() {
     setSelectedDateTime((current) => {
       const next = new Date(current);
       next.setHours(value.getHours(), value.getMinutes(), 0, 0);
-      return next;
+      return clampDateTime(next, minPlanningDate, maxPlanningDate);
     });
   };
 
@@ -524,7 +557,7 @@ export default function App() {
     setSelectedDateTime((current) => {
       const next = new Date(current);
       next.setFullYear(value.getFullYear(), value.getMonth(), value.getDate());
-      return next;
+      return clampDateTime(next, minPlanningDate, maxPlanningDate);
     });
   };
 
@@ -539,9 +572,25 @@ export default function App() {
       const next = new Date(current);
       next.setFullYear(value.getFullYear(), value.getMonth(), value.getDate());
       next.setHours(value.getHours(), value.getMinutes(), 0, 0);
-      return next;
+      return clampDateTime(next, minPlanningDate, maxPlanningDate);
     });
   };
+
+  useEffect(() => {
+    setSelectedDateTime((current) => clampDateTime(current, minPlanningDate, maxPlanningDate));
+  }, [minPlanningDate, maxPlanningDate]);
+
+  useEffect(() => {
+    if (activePicker === "none") {
+      return;
+    }
+    const interval = setInterval(() => {
+      setMinPlanningDate(getRoundedNow(TIME_STEP_MINUTES));
+    }, 30000);
+    return () => {
+      clearInterval(interval);
+    };
+  }, [activePicker]);
 
   useEffect(() => {
     let count = 1;
@@ -667,28 +716,13 @@ export default function App() {
       </Text>
 
       <Text style={styles.controlLabel}>When</Text>
-      <View style={styles.quickPresetRow}>
-        {([
-          { key: "tonight", label: "Tonight" },
-          { key: "tomorrow", label: "Tomorrow" },
-          { key: "weekend", label: "This weekend" }
-        ] as const).map((preset) => (
-          <Pressable
-            key={preset.key}
-            style={styles.segment}
-            onPress={() => applyWhenPreset(preset.key)}
-          >
-            <Text style={styles.segmentText}>{preset.label}</Text>
-          </Pressable>
-        ))}
-      </View>
       {Platform.OS === "ios" ? (
         <>
           <View style={styles.pickerRow}>
             <Pressable
               style={[styles.pickerButton, styles.pickerButtonFull]}
               onPress={() => {
-                setActivePicker((current) => (current === "datetime" ? "none" : "datetime"));
+                togglePicker("datetime");
               }}
             >
               <Text style={styles.pickerButtonLabel}>Date & Time</Text>
@@ -717,7 +751,7 @@ export default function App() {
             <Pressable
               style={styles.pickerButton}
               onPress={() => {
-                setActivePicker((current) => (current === "date" ? "none" : "date"));
+                togglePicker("date");
               }}
             >
               <Text style={styles.pickerButtonLabel}>Date</Text>
@@ -726,7 +760,7 @@ export default function App() {
             <Pressable
               style={styles.pickerButton}
               onPress={() => {
-                setActivePicker((current) => (current === "time" ? "none" : "time"));
+                togglePicker("time");
               }}
             >
               <Text style={styles.pickerButtonLabel}>Start Time</Text>
@@ -791,7 +825,7 @@ export default function App() {
           <Slider
             style={styles.radiusSlider}
             minimumValue={1}
-            maximumValue={8}
+            maximumValue={15}
             step={0.5}
             value={selectedRadiusMiles}
             onValueChange={(value) => setSelectedRadiusMiles(Number(value.toFixed(1)))}
@@ -801,8 +835,8 @@ export default function App() {
           />
           <View style={styles.radiusScaleRow}>
             <Text style={styles.radiusScaleText}>1 mi</Text>
-            <Text style={styles.radiusScaleText}>4.5 mi</Text>
             <Text style={styles.radiusScaleText}>8 mi</Text>
+            <Text style={styles.radiusScaleText}>15 mi</Text>
           </View>
         </View>
       ) : (
@@ -841,21 +875,30 @@ export default function App() {
         })}
       </View>
 
-      <Text style={styles.controlLabel}>Budget</Text>
-      <View style={styles.inlineRow}>
-        {(["$", "$$", "$$$"] as BudgetTier[]).map((tier) => {
+      <Text style={styles.controlLabel}>Budget cap for two</Text>
+      <View style={styles.budgetRow}>
+        {BUDGET_TIERS.map((tier) => {
           const selected = tier === selectedBudget;
+          const budget = BUDGET_OPTIONS[tier];
           return (
             <Pressable
               key={tier}
-              style={[styles.segment, selected && styles.segmentSelected]}
+              style={[styles.budgetCard, selected && styles.budgetCardSelected]}
               onPress={() => setSelectedBudget(tier)}
             >
-              <Text style={[styles.segmentText, selected && styles.segmentTextSelected]}>{tier}</Text>
+              <Text style={[styles.budgetTitle, selected && styles.budgetTitleSelected]}>
+                {budget.title}
+              </Text>
+              {budget.subtitle ? (
+                <Text style={[styles.budgetSubtitle, selected && styles.budgetSubtitleSelected]}>
+                  {budget.subtitle}
+                </Text>
+              ) : null}
             </Pressable>
           );
         })}
       </View>
+      <Text style={styles.controlHelpText}>Single-select max spend. Lower-cost ideas are always included.</Text>
 
       <Text style={styles.controlLabel}>Time Commitment</Text>
       <View style={styles.inlineRow}>
@@ -883,13 +926,13 @@ export default function App() {
   const DiscoverTab = (
     <View style={styles.tabBody}>
       <Text style={styles.tabIntro}>
-        Ideas for {selectedDateLabel} around {formatClock(selectedStartMinutes)}, tuned to your budget and area.
+        Ideas for {selectedDateLabel} around {formatClock(selectedStartMinutes)}, tuned to your spend cap and area.
       </Text>
       {discoverIdeas.length === 0 ? (
         <Animated.View style={[styles.emptyState, animatedStyle(animatedValues[0])]}>
           <Ionicons name="search-outline" size={26} color={PALETTE.deep} />
           <Text style={styles.emptyTitle}>No exact matches for this plan</Text>
-          <Text style={styles.emptyBody}>Try widening area or adjusting date, time, budget, and vibe.</Text>
+          <Text style={styles.emptyBody}>Try widening area or adjusting date, time, spend range, and vibe.</Text>
         </Animated.View>
       ) : (
         discoverIdeas.map((idea, index) => {
@@ -916,7 +959,7 @@ export default function App() {
                 <Text style={styles.ideaBlurb}>{idea.blurb}</Text>
 
                 <View style={styles.metaRow}>
-                  <Text style={styles.metaText}>{idea.cost}</Text>
+                  <Text style={styles.metaText}>{formatBudgetRange(idea.cost)}</Text>
                   <Text style={styles.metaDot}>•</Text>
                   <Text style={styles.metaText}>{formatMinutes(idea.durationMinutes)}</Text>
                   <Text style={styles.metaDot}>•</Text>
@@ -943,7 +986,7 @@ export default function App() {
     <View style={styles.tabBody}>
       <Text style={styles.tabIntro}>
         Built itinerary for {selectedDateLabel} at {formatClock(selectedStartMinutes)} with{" "}
-        {TIME_OPTIONS[selectedTime].label.toLowerCase()} pace and {selectedBudget} budget.
+        {TIME_OPTIONS[selectedTime].label.toLowerCase()} pace and the {selectedBudgetLabel} spend cap.
       </Text>
       <Pressable style={styles.shuffleButton} onPress={() => setPlanSeed((current) => current + 1)}>
         <Ionicons name="shuffle-outline" size={16} color={PALETTE.cream} />
@@ -1003,7 +1046,7 @@ export default function App() {
               <Text style={styles.ideaBlurb}>{idea.blurb}</Text>
 
               <View style={styles.metaRow}>
-                <Text style={styles.metaText}>{idea.cost}</Text>
+                <Text style={styles.metaText}>{formatBudgetRange(idea.cost)}</Text>
                 <Text style={styles.metaDot}>•</Text>
                 <Text style={styles.metaText}>{formatMinutes(idea.durationMinutes)}</Text>
                 <Text style={styles.metaDot}>•</Text>
@@ -1244,6 +1287,13 @@ const styles = StyleSheet.create({
     marginBottom: 6,
     fontFamily: FONT?.subtitle
   },
+  controlHelpText: {
+    color: "rgba(247, 242, 233, 0.7)",
+    fontSize: 11,
+    marginTop: 6,
+    marginBottom: 2,
+    fontFamily: FONT?.body
+  },
   locationModeRow: {
     flexDirection: "row",
     gap: 8
@@ -1338,6 +1388,51 @@ const styles = StyleSheet.create({
     gap: 8,
     flexWrap: "wrap"
   },
+  budgetRow: {
+    flexDirection: "row",
+    flexWrap: "nowrap",
+    gap: 8
+  },
+  budgetCard: {
+    flexGrow: 1,
+    flexShrink: 1,
+    flexBasis: 0,
+    minWidth: 0,
+    borderRadius: 13,
+    borderWidth: 1,
+    borderColor: "rgba(247, 242, 233, 0.25)",
+    backgroundColor: "rgba(247, 242, 233, 0.08)",
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    height: 68,
+    justifyContent: "center",
+    alignItems: "center"
+  },
+  budgetCardSelected: {
+    backgroundColor: PALETTE.coral,
+    borderColor: PALETTE.coral
+  },
+  budgetTitle: {
+    color: PALETTE.cream,
+    fontSize: 12,
+    lineHeight: 16,
+    fontFamily: FONT?.subtitle,
+    textAlign: "center"
+  },
+  budgetTitleSelected: {
+    color: "#231E1A"
+  },
+  budgetSubtitle: {
+    marginTop: 2,
+    color: "rgba(247, 242, 233, 0.78)",
+    fontSize: 10,
+    lineHeight: 12,
+    fontFamily: FONT?.body,
+    textAlign: "center"
+  },
+  budgetSubtitleSelected: {
+    color: "rgba(35, 30, 26, 0.8)"
+  },
   segment: {
     borderRadius: 12,
     borderWidth: 1,
@@ -1390,12 +1485,6 @@ const styles = StyleSheet.create({
   },
   timeSubLabelSelected: {
     color: "rgba(23, 33, 43, 0.75)"
-  },
-  quickPresetRow: {
-    flexDirection: "row",
-    gap: 8,
-    flexWrap: "wrap",
-    marginBottom: 8
   },
   pickerRow: {
     flexDirection: "row",
