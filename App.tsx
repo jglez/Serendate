@@ -13,11 +13,13 @@ import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
 import Slider from "@react-native-community/slider";
+import DateTimePicker, { DateTimePickerEvent } from "@react-native-community/datetimepicker";
 
 type TabKey = "Discover" | "Plan" | "Saved";
 type BudgetTier = "$" | "$$" | "$$$";
 type TimeKey = "quick" | "standard" | "linger";
 type LocationFilterMode = "radius" | "neighborhood";
+type ActivePicker = "none" | "date" | "time" | "datetime";
 
 const VIBE_OPTIONS = ["Cozy", "Playful", "Artsy", "Adventurous"] as const;
 type Vibe = (typeof VIBE_OPTIONS)[number];
@@ -94,17 +96,13 @@ const TIME_OPTIONS: Record<TimeKey, TimeOption> = {
   linger: { label: "Linger", subLabel: "~5 hrs", maxMinutes: 320 }
 };
 
+const MAX_PLANNING_DAYS_AHEAD = 120;
+const TIME_STEP_MINUTES = 5;
+
 const BUDGET_RANK: Record<BudgetTier, number> = {
   "$": 1,
   "$$": 2,
   "$$$": 3
-};
-
-const WEATHER = {
-  neighborhood: "San Francisco",
-  tempF: 58,
-  condition: "rain" as WeatherMode,
-  headline: "Light rain expected after 7:30 PM"
 };
 
 const LIMITED_EVENT = {
@@ -113,6 +111,7 @@ const LIMITED_EVENT = {
   neighborhood: "Mission",
   time: "6:00 PM - 10:00 PM",
   blurb: "Pop-up galleries, live jazz, and late-night food stalls.",
+  dayOfWeek: 5,
   indoor: false
 };
 
@@ -157,7 +156,7 @@ const IDEAS: DateIdea[] = [
     distanceMiles: 2.2,
     vibes: ["Artsy", "Playful"],
     weatherFit: "any",
-    eventTag: "Tonight only: rooftop telescope hour",
+    eventTag: "Friday special: rooftop telescope hour",
     blurb: "Hands-on exhibits, then rooftop skyline viewing with guided stargazing."
   },
   {
@@ -282,12 +281,21 @@ function formatClock(totalMinutes: number): string {
   return `${hour12}:${String(minutes).padStart(2, "0")} ${period}`;
 }
 
+function formatDateLabel(date: Date): string {
+  return new Intl.DateTimeFormat("en-US", {
+    weekday: "short",
+    month: "short",
+    day: "numeric"
+  }).format(date);
+}
+
 function buildItinerary(
   ideas: DateIdea[],
   budget: BudgetTier,
   maxMinutes: number,
   seed: number,
-  includeLocalEvent: boolean
+  includeLocalEvent: boolean,
+  startMinutes: number
 ): PlanStop[] {
   const fitsBudget = ideas.filter((idea) => BUDGET_RANK[idea.cost] <= BUDGET_RANK[budget]);
   const pool = fitsBudget.length > 0 ? fitsBudget : ideas;
@@ -299,7 +307,7 @@ function buildItinerary(
   const rotated = pool.slice(rotation).concat(pool.slice(0, rotation));
 
   const plan: PlanStop[] = [];
-  let clock = 18 * 60 + 20;
+  let clock = startMinutes;
   let remaining = maxMinutes;
 
   for (const idea of rotated) {
@@ -364,6 +372,16 @@ export default function App() {
   const [selectedVibe, setSelectedVibe] = useState<Vibe>("Cozy");
   const [selectedBudget, setSelectedBudget] = useState<BudgetTier>("$$");
   const [selectedTime, setSelectedTime] = useState<TimeKey>("standard");
+  const [selectedDateTime, setSelectedDateTime] = useState<Date>(() => {
+    const now = new Date();
+    const defaultDateTime = new Date(now);
+    defaultDateTime.setHours(19, 0, 0, 0);
+    if (defaultDateTime.getTime() <= now.getTime()) {
+      defaultDateTime.setDate(defaultDateTime.getDate() + 1);
+    }
+    return defaultDateTime;
+  });
+  const [activePicker, setActivePicker] = useState<ActivePicker>("none");
   const [preferOutdoor, setPreferOutdoor] = useState(false);
   const [locationFilterMode, setLocationFilterMode] = useState<LocationFilterMode>("radius");
   const [selectedRadiusMiles, setSelectedRadiusMiles] = useState(3.5);
@@ -412,6 +430,30 @@ export default function App() {
     [savedIds]
   );
 
+  const selectedDate = useMemo(() => {
+    const date = new Date(selectedDateTime);
+    date.setHours(0, 0, 0, 0);
+    return date;
+  }, [selectedDateTime]);
+
+  const selectedStartMinutes = useMemo(
+    () => selectedDateTime.getHours() * 60 + selectedDateTime.getMinutes(),
+    [selectedDateTime]
+  );
+
+  const maxPlanningDate = useMemo(() => {
+    const maxDate = new Date();
+    maxDate.setHours(23, 59, 59, 999);
+    maxDate.setDate(maxDate.getDate() + MAX_PLANNING_DAYS_AHEAD);
+    return maxDate;
+  }, []);
+
+  const minPlanningDate = useMemo(() => {
+    const minDate = new Date();
+    minDate.setSeconds(0, 0);
+    return minDate;
+  }, []);
+
   const itinerary = useMemo(
     () =>
       buildItinerary(
@@ -419,10 +461,87 @@ export default function App() {
         selectedBudget,
         TIME_OPTIONS[selectedTime].maxMinutes,
         planSeed,
-        preferOutdoor ? !LIMITED_EVENT.indoor : LIMITED_EVENT.indoor
+        selectedDate.getDay() === LIMITED_EVENT.dayOfWeek && (preferOutdoor ? !LIMITED_EVENT.indoor : LIMITED_EVENT.indoor),
+        selectedStartMinutes
       ),
-    [filteredIdeas, selectedBudget, selectedTime, planSeed, preferOutdoor]
+    [filteredIdeas, selectedBudget, selectedTime, planSeed, preferOutdoor, selectedDate, selectedStartMinutes]
   );
+
+  const selectedDateLabel = formatDateLabel(selectedDate);
+
+  const applyWhenPreset = (preset: "tonight" | "tomorrow" | "weekend") => {
+    const now = new Date();
+    const next = new Date(selectedDateTime);
+
+    if (preset === "tonight") {
+      next.setFullYear(now.getFullYear(), now.getMonth(), now.getDate());
+      next.setHours(19, 0, 0, 0);
+      if (next.getTime() <= now.getTime()) {
+        const rounded = new Date(now);
+        rounded.setSeconds(0, 0);
+        rounded.setMinutes(Math.ceil(rounded.getMinutes() / TIME_STEP_MINUTES) * TIME_STEP_MINUTES);
+        next.setTime(rounded.getTime());
+      }
+    } else if (preset === "tomorrow") {
+      next.setFullYear(now.getFullYear(), now.getMonth(), now.getDate() + 1);
+      next.setHours(19, 0, 0, 0);
+    } else {
+      const weekend = new Date(now);
+      const daysUntilSaturday = (6 - weekend.getDay() + 7) % 7;
+      weekend.setDate(weekend.getDate() + daysUntilSaturday);
+      weekend.setHours(19, 0, 0, 0);
+      if (weekend.getTime() <= now.getTime()) {
+        weekend.setDate(weekend.getDate() + 1);
+      }
+      next.setTime(weekend.getTime());
+    }
+
+    setSelectedDateTime(next);
+    setActivePicker("none");
+  };
+
+  const handleTimeChange = (_event: DateTimePickerEvent, value?: Date) => {
+    if (Platform.OS === "android") {
+      setActivePicker("none");
+    }
+    if (!value) {
+      return;
+    }
+    setSelectedDateTime((current) => {
+      const next = new Date(current);
+      next.setHours(value.getHours(), value.getMinutes(), 0, 0);
+      return next;
+    });
+  };
+
+  const handleDateChange = (_event: DateTimePickerEvent, value?: Date) => {
+    if (Platform.OS === "android") {
+      setActivePicker("none");
+    }
+    if (!value) {
+      return;
+    }
+    setSelectedDateTime((current) => {
+      const next = new Date(current);
+      next.setFullYear(value.getFullYear(), value.getMonth(), value.getDate());
+      return next;
+    });
+  };
+
+  const handleDateTimeChange = (_event: DateTimePickerEvent, value?: Date) => {
+    if (Platform.OS === "android") {
+      setActivePicker("none");
+    }
+    if (!value) {
+      return;
+    }
+    setSelectedDateTime((current) => {
+      const next = new Date(current);
+      next.setFullYear(value.getFullYear(), value.getMonth(), value.getDate());
+      next.setHours(value.getHours(), value.getMinutes(), 0, 0);
+      return next;
+    });
+  };
 
   useEffect(() => {
     let count = 1;
@@ -504,24 +623,26 @@ export default function App() {
 
   const selectedTab = pendingTab ?? activeTab;
 
-  const WeatherHeader = (
+  const PlannerHeader = (
     <View style={styles.infoRow}>
       <LinearGradient colors={[PALETTE.mint, "#A7DCCF"]} style={styles.infoCard}>
         <View style={styles.infoHead}>
-          <Ionicons name="rainy-outline" size={18} color={PALETTE.ink} />
-          <Text style={styles.infoTitle}>Weather in {WEATHER.neighborhood}</Text>
-        </View>
-        <Text style={styles.infoValue}>{WEATHER.tempF}°F</Text>
-        <Text style={styles.infoBody}>{WEATHER.headline}</Text>
-      </LinearGradient>
-
-      <LinearGradient colors={[PALETTE.peach, "#F7C28F"]} style={styles.infoCard}>
-        <View style={styles.infoHead}>
           <Ionicons name="sparkles-outline" size={18} color={PALETTE.ink} />
-          <Text style={styles.infoTitle}>Limited-Time Event</Text>
+          <Text style={styles.infoTitle}>Local Event Spotlight</Text>
         </View>
-        <Text style={styles.infoValue}>{LIMITED_EVENT.title}</Text>
-        <Text style={styles.infoBody}>{LIMITED_EVENT.time}</Text>
+        {selectedDate.getDay() === LIMITED_EVENT.dayOfWeek ? (
+          <>
+            <Text style={styles.infoValue}>{LIMITED_EVENT.title}</Text>
+            <Text style={styles.infoBody}>
+              {LIMITED_EVENT.time} · {LIMITED_EVENT.neighborhood}
+            </Text>
+          </>
+        ) : (
+          <>
+            <Text style={styles.infoValue}>No featured event for {selectedDateLabel}</Text>
+            <Text style={styles.infoBody}>This spotlight runs on Fridays. Your plan still stays local and date-aware.</Text>
+          </>
+        )}
       </LinearGradient>
     </View>
   );
@@ -543,6 +664,103 @@ export default function App() {
       </View>
       <Text style={styles.switchHelpText}>
         {preferOutdoor ? "Showing outdoor date ideas" : "Showing indoor date ideas"}
+      </Text>
+
+      <Text style={styles.controlLabel}>When</Text>
+      <View style={styles.quickPresetRow}>
+        {([
+          { key: "tonight", label: "Tonight" },
+          { key: "tomorrow", label: "Tomorrow" },
+          { key: "weekend", label: "This weekend" }
+        ] as const).map((preset) => (
+          <Pressable
+            key={preset.key}
+            style={styles.segment}
+            onPress={() => applyWhenPreset(preset.key)}
+          >
+            <Text style={styles.segmentText}>{preset.label}</Text>
+          </Pressable>
+        ))}
+      </View>
+      {Platform.OS === "ios" ? (
+        <>
+          <View style={styles.pickerRow}>
+            <Pressable
+              style={[styles.pickerButton, styles.pickerButtonFull]}
+              onPress={() => {
+                setActivePicker((current) => (current === "datetime" ? "none" : "datetime"));
+              }}
+            >
+              <Text style={styles.pickerButtonLabel}>Date & Time</Text>
+              <Text style={styles.pickerButtonValue}>
+                {selectedDateLabel} at {formatClock(selectedStartMinutes)}
+              </Text>
+            </Pressable>
+          </View>
+          {activePicker === "datetime" ? (
+            <View style={styles.whenPickerWrap}>
+              <DateTimePicker
+                value={selectedDateTime}
+                mode="datetime"
+                display="spinner"
+                minimumDate={minPlanningDate}
+                maximumDate={maxPlanningDate}
+                minuteInterval={TIME_STEP_MINUTES}
+                onChange={handleDateTimeChange}
+              />
+            </View>
+          ) : null}
+        </>
+      ) : (
+        <>
+          <View style={styles.pickerRow}>
+            <Pressable
+              style={styles.pickerButton}
+              onPress={() => {
+                setActivePicker((current) => (current === "date" ? "none" : "date"));
+              }}
+            >
+              <Text style={styles.pickerButtonLabel}>Date</Text>
+              <Text style={styles.pickerButtonValue}>{selectedDateLabel}</Text>
+            </Pressable>
+            <Pressable
+              style={styles.pickerButton}
+              onPress={() => {
+                setActivePicker((current) => (current === "time" ? "none" : "time"));
+              }}
+            >
+              <Text style={styles.pickerButtonLabel}>Start Time</Text>
+              <Text style={styles.pickerButtonValue}>{formatClock(selectedStartMinutes)}</Text>
+            </Pressable>
+          </View>
+          {activePicker === "date" ? (
+            <View style={styles.whenPickerWrap}>
+              <DateTimePicker
+                value={selectedDateTime}
+                mode="date"
+                display="default"
+                minimumDate={minPlanningDate}
+                maximumDate={maxPlanningDate}
+                onChange={handleDateChange}
+              />
+            </View>
+          ) : null}
+          {activePicker === "time" ? (
+            <View style={styles.whenPickerWrap}>
+              <DateTimePicker
+                value={selectedDateTime}
+                mode="time"
+                display="default"
+                minuteInterval={TIME_STEP_MINUTES}
+                onChange={handleTimeChange}
+              />
+            </View>
+          ) : null}
+        </>
+      )}
+
+      <Text style={styles.whenSummary}>
+        Planning for {selectedDateLabel} at {formatClock(selectedStartMinutes)}
       </Text>
 
       <Text style={styles.controlLabel}>Location Filter</Text>
@@ -664,12 +882,14 @@ export default function App() {
 
   const DiscoverTab = (
     <View style={styles.tabBody}>
-      <Text style={styles.tabIntro}>Fresh ideas nearby, tuned to your mood, budget, and setting.</Text>
+      <Text style={styles.tabIntro}>
+        Ideas for {selectedDateLabel} around {formatClock(selectedStartMinutes)}, tuned to your budget and area.
+      </Text>
       {discoverIdeas.length === 0 ? (
         <Animated.View style={[styles.emptyState, animatedStyle(animatedValues[0])]}>
           <Ionicons name="search-outline" size={26} color={PALETTE.deep} />
-          <Text style={styles.emptyTitle}>No exact matches right now</Text>
-          <Text style={styles.emptyBody}>Try widening neighborhood or bumping budget/time settings.</Text>
+          <Text style={styles.emptyTitle}>No exact matches for this plan</Text>
+          <Text style={styles.emptyBody}>Try widening area or adjusting date, time, budget, and vibe.</Text>
         </Animated.View>
       ) : (
         discoverIdeas.map((idea, index) => {
@@ -722,7 +942,8 @@ export default function App() {
   const PlanTab = (
     <View style={styles.tabBody}>
       <Text style={styles.tabIntro}>
-        Built itinerary for {TIME_OPTIONS[selectedTime].label.toLowerCase()} pace and {selectedBudget} budget.
+        Built itinerary for {selectedDateLabel} at {formatClock(selectedStartMinutes)} with{" "}
+        {TIME_OPTIONS[selectedTime].label.toLowerCase()} pace and {selectedBudget} budget.
       </Text>
       <Pressable style={styles.shuffleButton} onPress={() => setPlanSeed((current) => current + 1)}>
         <Ionicons name="shuffle-outline" size={16} color={PALETTE.cream} />
@@ -816,11 +1037,11 @@ export default function App() {
                 </View>
                 <View style={styles.cityPill}>
                   <Ionicons name="navigate-outline" size={13} color={PALETTE.cream} />
-                  <Text style={styles.cityPillText}>SF Nearby</Text>
+                  <Text style={styles.cityPillText}>SF Area</Text>
                 </View>
               </View>
 
-              {WeatherHeader}
+              {PlannerHeader}
 
               {Controls}
               <View
@@ -1169,6 +1390,59 @@ const styles = StyleSheet.create({
   },
   timeSubLabelSelected: {
     color: "rgba(23, 33, 43, 0.75)"
+  },
+  quickPresetRow: {
+    flexDirection: "row",
+    gap: 8,
+    flexWrap: "wrap",
+    marginBottom: 8
+  },
+  pickerRow: {
+    flexDirection: "row",
+    gap: 8
+  },
+  pickerButton: {
+    flex: 1,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "rgba(247, 242, 233, 0.25)",
+    backgroundColor: "rgba(247, 242, 233, 0.08)",
+    paddingVertical: 9,
+    paddingHorizontal: 10
+  },
+  pickerButtonFull: {
+    flex: 0,
+    width: "100%"
+  },
+  pickerButtonLabel: {
+    color: "rgba(247, 242, 233, 0.72)",
+    fontSize: 11,
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+    fontFamily: FONT?.subtitle
+  },
+  pickerButtonValue: {
+    color: PALETTE.cream,
+    fontSize: 14,
+    marginTop: 3,
+    fontFamily: FONT?.subtitle
+  },
+  whenPickerWrap: {
+    marginTop: 8,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "rgba(247, 242, 233, 0.22)",
+    backgroundColor: "rgba(247, 242, 233, 0.08)",
+    overflow: "hidden",
+    minHeight: Platform.OS === "ios" ? 216 : 56,
+    justifyContent: "center"
+  },
+  whenSummary: {
+    color: "rgba(247, 242, 233, 0.72)",
+    fontSize: 11,
+    marginTop: 6,
+    marginBottom: 2,
+    fontFamily: FONT?.body
   },
   tabBody: {
     marginTop: 2
