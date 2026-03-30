@@ -26,7 +26,6 @@ import {
   type SearchAnchor,
   type TimeCommitment,
   type VenueCategory,
-  type VenueSearchMeta,
   type VenueSummary,
   type Vibe
 } from "./shared/contracts";
@@ -458,32 +457,6 @@ function formatAnchorLabel(anchor: SearchAnchor | null): string {
   return anchor.label ?? (anchor.source === "device" ? "Current location" : "Manual area");
 }
 
-function buildDiscoverMetaLine(meta: VenueSearchMeta | null): string | null {
-  if (!meta) {
-    return null;
-  }
-
-  const parts = [
-    `${meta.broadCandidateCount} broad`,
-    `${meta.enrichedCount} checked`,
-    `${meta.returnedCount} returned`
-  ];
-
-  if (meta.broadFromCache) {
-    parts.push("broad cache hit");
-  }
-
-  if (meta.detailsCacheHits > 0) {
-    parts.push(`${meta.detailsCacheHits} detail cache hit${meta.detailsCacheHits === 1 ? "" : "s"}`);
-  }
-
-  if (meta.detailsCacheMisses > 0) {
-    parts.push(`${meta.detailsCacheMisses} detail fetch${meta.detailsCacheMisses === 1 ? "" : "es"}`);
-  }
-
-  return parts.join(" · ");
-}
-
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("Discover");
   const [pendingTab, setPendingTab] = useState<TabKey | null>(null);
@@ -516,7 +489,6 @@ export default function App() {
   const [isManualAreaLoading, setIsManualAreaLoading] = useState(false);
 
   const [discoverVenues, setDiscoverVenues] = useState<VenueSummary[]>([]);
-  const [discoverMeta, setDiscoverMeta] = useState<VenueSearchMeta | null>(null);
   const [discoverError, setDiscoverError] = useState<string | null>(null);
   const [isDiscoverLoading, setIsDiscoverLoading] = useState(false);
   const [hasCompletedDiscoverSearch, setHasCompletedDiscoverSearch] = useState(false);
@@ -579,7 +551,6 @@ export default function App() {
   const selectedDateLabel = formatDateLabel(selectedDate);
   const selectedBudgetLabel = formatBudgetSelection(selectedBudget);
   const activeAnchorLabel = formatAnchorLabel(searchAnchor);
-  const discoverMetaLine = buildDiscoverMetaLine(discoverMeta);
   const shouldShowUpdateButton =
     Boolean(searchAnchor) && (resultsStale || Boolean(discoverError) || (!hasCompletedDiscoverSearch && !isDiscoverLoading));
 
@@ -671,7 +642,6 @@ export default function App() {
     try {
       const response = await searchVenues(discoverRequest);
       setDiscoverVenues(response.venues);
-      setDiscoverMeta(response.meta);
       setHasCompletedDiscoverSearch(true);
       setResultsStale(false);
       lastSuccessfulDiscoverRequestKeyRef.current = discoverRequestKey;
@@ -1231,7 +1201,6 @@ export default function App() {
             </Pressable>
           ) : null}
         </View>
-        {discoverMetaLine ? <Text style={styles.debugMetaText}>{discoverMetaLine}</Text> : null}
         {discoverError ? <Text style={styles.errorText}>{discoverError}</Text> : null}
       </LinearGradient>
 
@@ -1963,13 +1932,6 @@ const styles = StyleSheet.create({
     color: PALETTE.cream,
     fontSize: 12,
     fontFamily: FONT?.subtitle
-  },
-  debugMetaText: {
-    marginTop: 8,
-    color: PALETTE.deep,
-    fontSize: 11,
-    lineHeight: 16,
-    fontFamily: FONT?.body
   },
   cardWrap: {
     marginBottom: 10

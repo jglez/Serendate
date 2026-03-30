@@ -7,7 +7,6 @@ import type {
   VenueEnvironment,
   VenueOpenStatus,
   VenueSearchRequest,
-  VenueSearchResponse,
   VenueSummary,
   Vibe
 } from "../../shared/contracts.js";
@@ -42,6 +41,32 @@ interface EnrichedCandidate extends BroadCandidate {
   ratingCount?: number;
   openStatus: VenueOpenStatus;
   exactScore: number;
+}
+
+export interface CandidateDiagnostic {
+  place_id: string;
+  name: string;
+  stage: "broad_only" | "enriched" | "returned" | "rejected";
+  reason?: "shortlist_cutoff" | "budget_cap_exceeded" | "closed_at_requested_time" | "final_result_cutoff";
+}
+
+export interface SearchDiagnostics {
+  broad_candidates_total: number;
+  finalists_enriched_total: number;
+  venues_returned_total: number;
+  broad_from_cache: boolean;
+  details_cache_hits: number;
+  details_cache_misses: number;
+  rejected_budget_total: number;
+  rejected_closed_total: number;
+  dropped_before_details_total: number;
+  dropped_after_exact_ranking_total: number;
+  candidates: CandidateDiagnostic[];
+}
+
+export interface VenueSearchResult {
+  venues: VenueSummary[];
+  diagnostics: SearchDiagnostics;
 }
 
 const TYPE_PROFILES: Record<string, TypeProfile> = {
@@ -88,7 +113,7 @@ const LINGER_TYPES = new Set([
 export class VenueSearchService {
   constructor(private readonly google: GooglePlacesClient) {}
 
-  async search(request: VenueSearchRequest): Promise<VenueSearchResponse> {
+  async search(request: VenueSearchRequest): Promise<VenueSearchResult> {
     const broadResult = await this.google.searchNearby(request.anchor, request.radiusMiles);
     const broadCandidates = broadResult.places
       .map((place) => buildBroadCandidate(place, request.anchor, request))
@@ -97,6 +122,16 @@ export class VenueSearchService {
     const finalists = broadCandidates.slice(0, 8);
     let detailsCacheHits = 0;
     let detailsCacheMisses = 0;
+    let rejectedBudgetTotal = 0;
+    let rejectedClosedTotal = 0;
+    const candidateDiagnostics: CandidateDiagnostic[] = broadCandidates
+      .slice(8)
+      .map((candidate) => ({
+        place_id: candidate.place.id,
+        name: candidate.place.name,
+        stage: "broad_only",
+        reason: "shortlist_cutoff"
+      }));
 
     const enriched = await Promise.all(
       finalists.map(async (candidate) => {
@@ -116,23 +151,75 @@ export class VenueSearchService {
       })
     );
 
-    const venues = enriched
-      .filter((candidate) => candidate !== null)
+    const acceptedCandidates: EnrichedCandidate[] = [];
+
+    for (const enrichedCandidate of enriched) {
+      if (enrichedCandidate === null) {
+        continue;
+      }
+
+      if (enrichedCandidate.status === "accepted") {
+        acceptedCandidates.push(enrichedCandidate.candidate);
+        continue;
+      }
+
+      if (enrichedCandidate.reason === "budget_cap_exceeded") {
+        rejectedBudgetTotal += 1;
+      } else if (enrichedCandidate.reason === "closed_at_requested_time") {
+        rejectedClosedTotal += 1;
+      }
+
+      candidateDiagnostics.push({
+        place_id: enrichedCandidate.candidate.place.id,
+        name: enrichedCandidate.candidate.place.name,
+        stage: "rejected",
+        reason: enrichedCandidate.reason
+      });
+    }
+
+    const rankedAcceptedCandidates = acceptedCandidates
       .sort((left, right) => right.exactScore - left.exactScore)
-      .slice(0, 6)
-      .map((candidate) => toVenueSummary(candidate, request));
+      .map((candidate, index) => ({
+        candidate,
+        index
+      }));
+
+    const returnedRankedCandidates = rankedAcceptedCandidates.slice(0, 6);
+    const droppedAfterExactRanking = rankedAcceptedCandidates.slice(6);
+
+    for (const { candidate } of droppedAfterExactRanking) {
+      candidateDiagnostics.push({
+        place_id: candidate.place.id,
+        name: candidate.place.name,
+        stage: "enriched",
+        reason: "final_result_cutoff"
+      });
+    }
+
+    for (const { candidate } of returnedRankedCandidates) {
+      candidateDiagnostics.push({
+        place_id: candidate.place.id,
+        name: candidate.place.name,
+        stage: "returned"
+      });
+    }
+
+    const venues = returnedRankedCandidates.map(({ candidate }) => toVenueSummary(candidate, request));
 
     return {
       venues,
-      meta: {
-        anchor: request.anchor,
-        searchMode: "broad+enriched",
-        broadCandidateCount: broadCandidates.length,
-        enrichedCount: finalists.length,
-        returnedCount: venues.length,
-        broadFromCache: broadResult.fromCache,
-        detailsCacheHits,
-        detailsCacheMisses
+      diagnostics: {
+        broad_candidates_total: broadCandidates.length,
+        finalists_enriched_total: finalists.length,
+        venues_returned_total: venues.length,
+        broad_from_cache: broadResult.fromCache,
+        details_cache_hits: detailsCacheHits,
+        details_cache_misses: detailsCacheMisses,
+        rejected_budget_total: rejectedBudgetTotal,
+        rejected_closed_total: rejectedClosedTotal,
+        dropped_before_details_total: Math.max(broadCandidates.length - finalists.length, 0),
+        dropped_after_exact_ranking_total: droppedAfterExactRanking.length,
+        candidates: candidateDiagnostics
       }
     };
   }
@@ -181,16 +268,34 @@ function enrichCandidate(
   candidate: BroadCandidate,
   details: PlaceDetails | null,
   request: VenueSearchRequest
-): EnrichedCandidate | null {
+):
+  | {
+      status: "accepted";
+      candidate: EnrichedCandidate;
+    }
+  | {
+      status: "rejected";
+      candidate: BroadCandidate;
+      reason: CandidateDiagnostic["reason"];
+    }
+  | null {
   const priceTier = mapPriceLevel(details?.priceLevel);
   const openStatus = evaluateOpenStatus(details, request.whenIso);
 
   if (priceTier && BUDGET_RANK[priceTier] > BUDGET_RANK[request.budgetCap]) {
-    return null;
+    return {
+      status: "rejected",
+      candidate,
+      reason: "budget_cap_exceeded"
+    };
   }
 
   if (openStatus === "closed") {
-    return null;
+    return {
+      status: "rejected",
+      candidate,
+      reason: "closed_at_requested_time"
+    };
   }
 
   let exactScore = candidate.cheapScore;
@@ -216,13 +321,16 @@ function enrichCandidate(
   }
 
   return {
-    ...candidate,
-    details,
-    priceTier,
-    rating: details?.rating,
-    ratingCount: details?.userRatingCount,
-    openStatus,
-    exactScore
+    status: "accepted",
+    candidate: {
+      ...candidate,
+      details,
+      priceTier,
+      rating: details?.rating,
+      ratingCount: details?.userRatingCount,
+      openStatus,
+      exactScore
+    }
   };
 }
 

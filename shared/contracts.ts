@@ -83,18 +83,6 @@ export interface VenueSearchRequest {
   timeCommitment: TimeCommitment;
 }
 
-export interface VenueSearchMeta {
-  anchor: SearchAnchor;
-  searchMode: "broad+enriched";
-  broadCandidateCount: number;
-  enrichedCount: number;
-  returnedCount: number;
-  broadFromCache: boolean;
-  detailsCacheHits: number;
-  detailsCacheMisses: number;
-}
-
 export interface VenueSearchResponse {
   venues: VenueSummary[];
-  meta: VenueSearchMeta;
 }
