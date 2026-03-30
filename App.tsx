@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   Animated,
   Platform,
   Pressable,
@@ -7,29 +8,40 @@ import {
   StyleSheet,
   Switch,
   Text,
+  TextInput,
   View
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
+import * as Location from "expo-location";
 import { LinearGradient } from "expo-linear-gradient";
 import { Ionicons } from "@expo/vector-icons";
 import Slider from "@react-native-community/slider";
 import DateTimePicker, { DateTimePickerEvent } from "@react-native-community/datetimepicker";
+import {
+  BUDGET_TIERS,
+  VIBE_OPTIONS,
+  type BudgetTier,
+  type EnvironmentPreference,
+  type LocationSuggestion,
+  type SearchAnchor,
+  type TimeCommitment,
+  type VenueCategory,
+  type VenueSearchMeta,
+  type VenueSummary,
+  type Vibe
+} from "./shared/contracts";
+import { searchAreas, searchVenues } from "./serendateApi";
 
 type TabKey = "Discover" | "Plan" | "Saved";
-type BudgetTier = "Free" | "$" | "$$" | "$$$";
-type TimeKey = "quick" | "standard" | "linger";
-type LocationFilterMode = "radius" | "neighborhood";
+type TimeKey = TimeCommitment;
 type ActivePicker = "none" | "date" | "time" | "datetime";
-
-const VIBE_OPTIONS = ["Cozy", "Playful", "Artsy", "Adventurous"] as const;
-type Vibe = (typeof VIBE_OPTIONS)[number];
-
+type CurrentLocationState = "loading" | "granted" | "denied" | "error";
 type WeatherMode = "sun" | "rain" | "any";
 
 interface DateIdea {
   id: string;
   title: string;
-  category: "Food" | "Bar" | "Museum" | "Nature" | "Event" | "Experience";
+  category: Extract<VenueCategory, "Food" | "Bar" | "Museum" | "Nature" | "Experience">;
   neighborhood: string;
   venue: string;
   indoor: boolean;
@@ -110,8 +122,6 @@ const BUDGET_RANK: Record<BudgetTier, number> = {
   "$$": 2,
   "$$$": 3
 };
-
-const BUDGET_TIERS: BudgetTier[] = ["Free", "$", "$$", "$$$"];
 
 const BUDGET_OPTIONS: Record<BudgetTier, BudgetOption> = {
   Free: { title: "Free" },
@@ -198,7 +208,7 @@ const IDEAS: DateIdea[] = [
   {
     id: "poetry-night",
     title: "Open Mic + Dessert Flight",
-    category: "Event",
+    category: "Experience",
     neighborhood: "Mission",
     venue: "Paper Lantern Cafe",
     indoor: true,
@@ -268,13 +278,14 @@ const IDEAS: DateIdea[] = [
   }
 ];
 
-const CATEGORY_ICON: Record<DateIdea["category"], keyof typeof Ionicons.glyphMap> = {
+const CATEGORY_ICON: Record<VenueCategory, keyof typeof Ionicons.glyphMap> = {
   Food: "restaurant-outline",
   Bar: "wine-outline",
   Museum: "color-palette-outline",
   Nature: "leaf-outline",
-  Event: "flash-outline",
-  Experience: "ticket-outline"
+  Experience: "ticket-outline",
+  Shopping: "book-outline",
+  Unknown: "compass-outline"
 };
 
 const TABS: TabKey[] = ["Discover", "Plan", "Saved"];
@@ -318,6 +329,19 @@ function formatBudgetRange(tier: BudgetTier): string {
 function formatBudgetSelection(tier: BudgetTier): string {
   const option = BUDGET_OPTIONS[tier];
   return option.subtitle ?? option.title;
+}
+
+function formatVenueEnvironment(environment: VenueSummary["environment"]): string {
+  switch (environment) {
+    case "indoor":
+      return "Indoor";
+    case "outdoor":
+      return "Outdoor";
+    case "mixed":
+      return "Mixed";
+    case "unknown":
+      return "Flexible";
+  }
 }
 
 function getRoundedNow(stepMinutes: number): Date {
@@ -426,6 +450,40 @@ function animatedStyle(value: Animated.Value) {
   };
 }
 
+function formatAnchorLabel(anchor: SearchAnchor | null): string {
+  if (!anchor) {
+    return "Search another area";
+  }
+
+  return anchor.label ?? (anchor.source === "device" ? "Current location" : "Manual area");
+}
+
+function buildDiscoverMetaLine(meta: VenueSearchMeta | null): string | null {
+  if (!meta) {
+    return null;
+  }
+
+  const parts = [
+    `${meta.broadCandidateCount} broad`,
+    `${meta.enrichedCount} checked`,
+    `${meta.returnedCount} returned`
+  ];
+
+  if (meta.broadFromCache) {
+    parts.push("broad cache hit");
+  }
+
+  if (meta.detailsCacheHits > 0) {
+    parts.push(`${meta.detailsCacheHits} detail cache hit${meta.detailsCacheHits === 1 ? "" : "s"}`);
+  }
+
+  if (meta.detailsCacheMisses > 0) {
+    parts.push(`${meta.detailsCacheMisses} detail fetch${meta.detailsCacheMisses === 1 ? "" : "es"}`);
+  }
+
+  return parts.join(" · ");
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("Discover");
   const [pendingTab, setPendingTab] = useState<TabKey | null>(null);
@@ -444,52 +502,34 @@ export default function App() {
   const [activePicker, setActivePicker] = useState<ActivePicker>("none");
   const [minPlanningDate, setMinPlanningDate] = useState<Date>(() => getRoundedNow(TIME_STEP_MINUTES));
   const [preferOutdoor, setPreferOutdoor] = useState(false);
-  const [locationFilterMode, setLocationFilterMode] = useState<LocationFilterMode>("radius");
   const [selectedRadiusMiles, setSelectedRadiusMiles] = useState(3.5);
-  const [selectedNeighborhood, setSelectedNeighborhood] = useState("All");
   const [savedIds, setSavedIds] = useState<string[]>(["vinyl-wine", "night-museum"]);
   const [planSeed, setPlanSeed] = useState(0);
+
+  const [currentLocationState, setCurrentLocationState] = useState<CurrentLocationState>("loading");
+  const [locationStatusMessage, setLocationStatusMessage] = useState("Finding your current location for Discover.");
+  const [deviceAnchor, setDeviceAnchor] = useState<SearchAnchor | null>(null);
+  const [searchAnchor, setSearchAnchor] = useState<SearchAnchor | null>(null);
+  const [manualAreaQuery, setManualAreaQuery] = useState("");
+  const [manualAreaSuggestions, setManualAreaSuggestions] = useState<LocationSuggestion[]>([]);
+  const [manualAreaError, setManualAreaError] = useState<string | null>(null);
+  const [isManualAreaLoading, setIsManualAreaLoading] = useState(false);
+
+  const [discoverVenues, setDiscoverVenues] = useState<VenueSummary[]>([]);
+  const [discoverMeta, setDiscoverMeta] = useState<VenueSearchMeta | null>(null);
+  const [discoverError, setDiscoverError] = useState<string | null>(null);
+  const [isDiscoverLoading, setIsDiscoverLoading] = useState(false);
+  const [hasCompletedDiscoverSearch, setHasCompletedDiscoverSearch] = useState(false);
+  const [resultsStale, setResultsStale] = useState(false);
+  const [autoSearchTrigger, setAutoSearchTrigger] = useState(0);
 
   const scrollViewRef = useRef<ScrollView>(null);
   const tabSectionTopRef = useRef<number | null>(null);
   const currentScrollYRef = useRef(0);
   const tabSwitchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const animatedValues = useRef(Array.from({ length: 16 }, () => new Animated.Value(0))).current;
-
-  const neighborhoods = useMemo(
-    () => ["All", ...Array.from(new Set(IDEAS.map((idea) => idea.neighborhood)))],
-    []
-  );
-
-  const filteredIdeas = useMemo(() => {
-    return IDEAS.filter((idea) => {
-      const locationMatch =
-        locationFilterMode === "radius"
-          ? idea.distanceMiles <= selectedRadiusMiles
-          : selectedNeighborhood === "All" || idea.neighborhood === selectedNeighborhood;
-      const environmentMatch = preferOutdoor ? !idea.indoor : idea.indoor;
-      const budgetMatch = BUDGET_RANK[idea.cost] <= BUDGET_RANK[selectedBudget];
-      const vibeMatch = idea.vibes.includes(selectedVibe);
-      const durationMatch = idea.durationMinutes <= TIME_OPTIONS[selectedTime].maxMinutes;
-
-      return locationMatch && environmentMatch && budgetMatch && vibeMatch && durationMatch;
-    }).sort((a, b) => a.distanceMiles - b.distanceMiles);
-  }, [
-    locationFilterMode,
-    selectedNeighborhood,
-    selectedRadiusMiles,
-    preferOutdoor,
-    selectedBudget,
-    selectedVibe,
-    selectedTime
-  ]);
-
-  const discoverIdeas = useMemo(() => filteredIdeas.slice(0, 6), [filteredIdeas]);
-
-  const savedIdeas = useMemo(
-    () => IDEAS.filter((idea) => savedIds.includes(idea.id)),
-    [savedIds]
-  );
+  const searchAnchorRef = useRef<SearchAnchor | null>(null);
+  const lastSuccessfulDiscoverRequestKeyRef = useRef<string | null>(null);
 
   const selectedDate = useMemo(() => {
     const date = new Date(selectedDateTime);
@@ -500,6 +540,25 @@ export default function App() {
   const selectedStartMinutes = useMemo(
     () => selectedDateTime.getHours() * 60 + selectedDateTime.getMinutes(),
     [selectedDateTime]
+  );
+
+  const selectedEnvironment: EnvironmentPreference = preferOutdoor ? "outdoor" : "indoor";
+
+  const filteredIdeas = useMemo(() => {
+    return IDEAS.filter((idea) => {
+      const locationMatch = idea.distanceMiles <= selectedRadiusMiles;
+      const environmentMatch = preferOutdoor ? !idea.indoor : idea.indoor;
+      const budgetMatch = BUDGET_RANK[idea.cost] <= BUDGET_RANK[selectedBudget];
+      const vibeMatch = idea.vibes.includes(selectedVibe);
+      const durationMatch = idea.durationMinutes <= TIME_OPTIONS[selectedTime].maxMinutes;
+
+      return locationMatch && environmentMatch && budgetMatch && vibeMatch && durationMatch;
+    }).sort((left, right) => left.distanceMiles - right.distanceMiles);
+  }, [preferOutdoor, selectedBudget, selectedRadiusMiles, selectedTime, selectedVibe]);
+
+  const savedIdeas = useMemo(
+    () => IDEAS.filter((idea) => savedIds.includes(idea.id)),
+    [savedIds]
   );
 
   const maxPlanningDate = useMemo(() => getMaxPlanningDate(minPlanningDate), [minPlanningDate]);
@@ -514,18 +573,43 @@ export default function App() {
         selectedDate.getDay() === LIMITED_EVENT.dayOfWeek && (preferOutdoor ? !LIMITED_EVENT.indoor : LIMITED_EVENT.indoor),
         selectedStartMinutes
       ),
-    [filteredIdeas, selectedBudget, selectedTime, planSeed, preferOutdoor, selectedDate, selectedStartMinutes]
+    [filteredIdeas, planSeed, preferOutdoor, selectedBudget, selectedDate, selectedStartMinutes, selectedTime]
   );
 
   const selectedDateLabel = formatDateLabel(selectedDate);
   const selectedBudgetLabel = formatBudgetSelection(selectedBudget);
+  const activeAnchorLabel = formatAnchorLabel(searchAnchor);
+  const discoverMetaLine = buildDiscoverMetaLine(discoverMeta);
+  const shouldShowUpdateButton =
+    Boolean(searchAnchor) && (resultsStale || Boolean(discoverError) || (!hasCompletedDiscoverSearch && !isDiscoverLoading));
+
+  const discoverRequest = useMemo(() => {
+    if (!searchAnchor) {
+      return null;
+    }
+
+    return {
+      anchor: searchAnchor,
+      radiusMiles: selectedRadiusMiles,
+      whenIso: selectedDateTime.toISOString(),
+      budgetCap: selectedBudget,
+      environment: selectedEnvironment,
+      vibe: selectedVibe,
+      timeCommitment: selectedTime
+    };
+  }, [searchAnchor, selectedBudget, selectedDateTime, selectedEnvironment, selectedRadiusMiles, selectedTime, selectedVibe]);
+
+  const discoverRequestKey = discoverRequest ? JSON.stringify(discoverRequest) : null;
+
+  useEffect(() => {
+    searchAnchorRef.current = searchAnchor;
+  }, [searchAnchor]);
 
   const syncPlanningBounds = () => {
     const nextMin = getRoundedNow(TIME_STEP_MINUTES);
     const nextMax = getMaxPlanningDate(nextMin);
     setMinPlanningDate(nextMin);
     setSelectedDateTime((current) => clampDateTime(current, nextMin, nextMax));
-    return { nextMin, nextMax };
   };
 
   const togglePicker = (picker: Exclude<ActivePicker, "none">) => {
@@ -576,27 +660,194 @@ export default function App() {
     });
   };
 
+  const runDiscoverSearch = useCallback(async () => {
+    if (!discoverRequest || !discoverRequestKey) {
+      return;
+    }
+
+    setIsDiscoverLoading(true);
+    setDiscoverError(null);
+
+    try {
+      const response = await searchVenues(discoverRequest);
+      setDiscoverVenues(response.venues);
+      setDiscoverMeta(response.meta);
+      setHasCompletedDiscoverSearch(true);
+      setResultsStale(false);
+      lastSuccessfulDiscoverRequestKeyRef.current = discoverRequestKey;
+    } catch (error) {
+      setDiscoverError(
+        error instanceof Error ? error.message : "We could not refresh live venue recommendations right now."
+      );
+    } finally {
+      setIsDiscoverLoading(false);
+    }
+  }, [discoverRequest, discoverRequestKey]);
+
+  const handleManualAreaSearch = useCallback(async () => {
+    const query = manualAreaQuery.trim();
+    if (query.length < 3) {
+      setManualAreaError("Enter at least 3 characters before searching another area.");
+      setManualAreaSuggestions([]);
+      return;
+    }
+
+    setIsManualAreaLoading(true);
+    setManualAreaError(null);
+
+    try {
+      const response = await searchAreas({
+        query,
+        limit: 5
+      });
+
+      setManualAreaSuggestions(response.suggestions);
+
+      if (response.suggestions.length === 0) {
+        setManualAreaError("No areas matched that search. Try a neighborhood, district, or address.");
+      }
+    } catch (error) {
+      setManualAreaError(error instanceof Error ? error.message : "Area search failed.");
+      setManualAreaSuggestions([]);
+    } finally {
+      setIsManualAreaLoading(false);
+    }
+  }, [manualAreaQuery]);
+
+  const handleManualSuggestionSelect = useCallback((suggestion: LocationSuggestion) => {
+    const nextAnchor: SearchAnchor = {
+      latitude: suggestion.latitude,
+      longitude: suggestion.longitude,
+      label: suggestion.label,
+      source: "manual"
+    };
+
+    setSearchAnchor(nextAnchor);
+    setManualAreaQuery(suggestion.label);
+    setManualAreaSuggestions([]);
+    setManualAreaError(null);
+    setDiscoverError(null);
+    setResultsStale(false);
+    setAutoSearchTrigger((current) => current + 1);
+  }, []);
+
+  const handleUseCurrentLocation = useCallback(() => {
+    if (!deviceAnchor) {
+      return;
+    }
+
+    setSearchAnchor(deviceAnchor);
+    setManualAreaSuggestions([]);
+    setManualAreaError(null);
+    setDiscoverError(null);
+    setResultsStale(false);
+    setAutoSearchTrigger((current) => current + 1);
+  }, [deviceAnchor]);
+
   useEffect(() => {
-    setSelectedDateTime((current) => clampDateTime(current, minPlanningDate, maxPlanningDate));
-  }, [minPlanningDate, maxPlanningDate]);
+    let isCancelled = false;
+
+    const loadCurrentLocation = async () => {
+      try {
+        const permission = await Location.requestForegroundPermissionsAsync();
+        if (isCancelled) {
+          return;
+        }
+
+        if (permission.status !== Location.PermissionStatus.GRANTED) {
+          setCurrentLocationState("denied");
+          setLocationStatusMessage("Location is off, so Discover is ready for a typed area search instead.");
+          return;
+        }
+
+        const lastKnownPosition = await Location.getLastKnownPositionAsync();
+        const currentPosition =
+          lastKnownPosition ??
+          (await Location.getCurrentPositionAsync({
+            accuracy: Location.Accuracy.Balanced
+          }));
+
+        if (isCancelled) {
+          return;
+        }
+
+        if (!currentPosition) {
+          setCurrentLocationState("error");
+          setLocationStatusMessage("Current location lookup failed. Search another area to keep going.");
+          return;
+        }
+
+        const nextDeviceAnchor: SearchAnchor = {
+          latitude: currentPosition.coords.latitude,
+          longitude: currentPosition.coords.longitude,
+          label: "Current location",
+          source: "device"
+        };
+
+        setDeviceAnchor(nextDeviceAnchor);
+        setCurrentLocationState("granted");
+        setLocationStatusMessage("Using your current location as the default Discover center.");
+
+        if (!searchAnchorRef.current) {
+          setSearchAnchor(nextDeviceAnchor);
+          setAutoSearchTrigger((current) => current + 1);
+        }
+      } catch {
+        if (isCancelled) {
+          return;
+        }
+
+        setCurrentLocationState("error");
+        setLocationStatusMessage("Current location lookup failed. Search another area to keep going.");
+      }
+    };
+
+    void loadCurrentLocation();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (activePicker === "none") {
       return;
     }
+
     const interval = setInterval(() => {
       setMinPlanningDate(getRoundedNow(TIME_STEP_MINUTES));
     }, 30000);
+
     return () => {
       clearInterval(interval);
     };
   }, [activePicker]);
 
   useEffect(() => {
+    setSelectedDateTime((current) => clampDateTime(current, minPlanningDate, maxPlanningDate));
+  }, [maxPlanningDate, minPlanningDate]);
+
+  useEffect(() => {
+    if (autoSearchTrigger === 0 || !discoverRequest) {
+      return;
+    }
+
+    void runDiscoverSearch();
+  }, [autoSearchTrigger, discoverRequest, runDiscoverSearch]);
+
+  useEffect(() => {
+    if (!hasCompletedDiscoverSearch || !discoverRequestKey) {
+      return;
+    }
+
+    setResultsStale(lastSuccessfulDiscoverRequestKeyRef.current !== discoverRequestKey);
+  }, [discoverRequestKey, hasCompletedDiscoverSearch]);
+
+  useEffect(() => {
     let count = 1;
 
     if (activeTab === "Discover") {
-      count = discoverIdeas.length;
+      count = discoverVenues.length > 0 ? discoverVenues.length : 1;
     } else if (activeTab === "Plan") {
       count = itinerary.length > 0 ? itinerary.length : 1;
     } else {
@@ -608,14 +859,22 @@ export default function App() {
     Animated.stagger(
       70,
       Array.from({ length: count }, (_, index) =>
-        Animated.timing(animatedValues[index], {
+        Animated.timing(animatedValues[index]!, {
           toValue: 1,
           duration: 280,
           useNativeDriver: true
         })
       )
     ).start();
-  }, [activeTab, animatedValues, discoverIdeas.length, itinerary.length, savedIdeas.length]);
+  }, [activeTab, animatedValues, discoverVenues.length, itinerary.length, savedIdeas.length]);
+
+  useEffect(() => {
+    return () => {
+      if (tabSwitchTimeoutRef.current !== null) {
+        clearTimeout(tabSwitchTimeoutRef.current);
+      }
+    };
+  }, []);
 
   const toggleSaved = (id: string) => {
     setSavedIds((current) =>
@@ -662,14 +921,6 @@ export default function App() {
     applyTab();
   };
 
-  useEffect(() => {
-    return () => {
-      if (tabSwitchTimeoutRef.current !== null) {
-        clearTimeout(tabSwitchTimeoutRef.current);
-      }
-    };
-  }, []);
-
   const selectedTab = pendingTab ?? activeTab;
 
   const PlannerHeader = (
@@ -689,7 +940,9 @@ export default function App() {
         ) : (
           <>
             <Text style={styles.infoValue}>No featured event for {selectedDateLabel}</Text>
-            <Text style={styles.infoBody}>This spotlight runs on Fridays. Your plan still stays local and date-aware.</Text>
+            <Text style={styles.infoBody}>
+              This spotlight runs on Fridays. Your plan still stays local and date-aware.
+            </Text>
           </>
         )}
       </LinearGradient>
@@ -797,67 +1050,99 @@ export default function App() {
         Planning for {selectedDateLabel} at {formatClock(selectedStartMinutes)}
       </Text>
 
-      <Text style={styles.controlLabel}>Location Filter</Text>
-      <View style={styles.locationModeRow}>
-        {(["radius", "neighborhood"] as LocationFilterMode[]).map((mode) => {
-          const selected = mode === locationFilterMode;
-          const label = mode === "radius" ? "By Radius" : "By Neighborhood";
-          return (
-            <Pressable
-              key={mode}
-              style={[styles.locationModeButton, selected && styles.locationModeButtonSelected]}
-              onPress={() => setLocationFilterMode(mode)}
-            >
-              <Text style={[styles.locationModeButtonText, selected && styles.locationModeButtonTextSelected]}>
-                {label}
-              </Text>
-            </Pressable>
-          );
-        })}
+      <Text style={styles.controlLabel}>Search Area</Text>
+      <View style={styles.locationCard}>
+        <View style={styles.locationCardHeader}>
+          <Ionicons name="navigate-outline" size={16} color={PALETTE.ink} />
+          <Text style={styles.locationCardTitle}>{activeAnchorLabel}</Text>
+        </View>
+        <Text style={styles.locationCardBody}>
+          {searchAnchor?.source === "manual" ? "Manual area override is active for Discover." : locationStatusMessage}
+        </Text>
+        {deviceAnchor && searchAnchor?.source === "manual" ? (
+          <Pressable style={styles.secondaryButton} onPress={handleUseCurrentLocation}>
+            <Ionicons name="locate-outline" size={14} color={PALETTE.ink} />
+            <Text style={styles.secondaryButtonText}>Use current location</Text>
+          </Pressable>
+        ) : null}
       </View>
 
-      {locationFilterMode === "radius" ? (
-        <View style={styles.radiusPanel}>
-          <View style={styles.radiusHeaderRow}>
-            <Text style={styles.radiusValue}>Within {selectedRadiusMiles.toFixed(1)} mi</Text>
-            <Text style={styles.radiusHint}>Distance from your area</Text>
-          </View>
-          <Slider
-            style={styles.radiusSlider}
-            minimumValue={1}
-            maximumValue={15}
-            step={0.5}
-            value={selectedRadiusMiles}
-            onValueChange={(value) => setSelectedRadiusMiles(Number(value.toFixed(1)))}
-            minimumTrackTintColor={PALETTE.coral}
-            maximumTrackTintColor="rgba(247, 242, 233, 0.32)"
-            thumbTintColor={PALETTE.peach}
-          />
-          <View style={styles.radiusScaleRow}>
-            <Text style={styles.radiusScaleText}>1 mi</Text>
-            <Text style={styles.radiusScaleText}>8 mi</Text>
-            <Text style={styles.radiusScaleText}>15 mi</Text>
-          </View>
+      <Text style={styles.controlLabel}>Search Another Area</Text>
+      <View style={styles.searchRow}>
+        <TextInput
+          value={manualAreaQuery}
+          onChangeText={(value) => {
+            setManualAreaQuery(value);
+            setManualAreaSuggestions([]);
+            if (manualAreaError) {
+              setManualAreaError(null);
+            }
+          }}
+          onSubmitEditing={() => {
+            void handleManualAreaSearch();
+          }}
+          placeholder="Neighborhood, district, or address"
+          placeholderTextColor="rgba(247, 242, 233, 0.46)"
+          style={styles.searchInput}
+          autoCapitalize="words"
+          returnKeyType="search"
+        />
+        <Pressable
+          style={[styles.searchButton, isManualAreaLoading && styles.searchButtonDisabled]}
+          onPress={() => {
+            void handleManualAreaSearch();
+          }}
+          disabled={isManualAreaLoading}
+        >
+          {isManualAreaLoading ? (
+            <ActivityIndicator size="small" color={PALETTE.ink} />
+          ) : (
+            <Text style={styles.searchButtonText}>Search</Text>
+          )}
+        </Pressable>
+      </View>
+      <Text style={styles.controlHelpText}>Submit-based only to keep venue search cheap and intentional.</Text>
+      {manualAreaError ? <Text style={styles.errorText}>{manualAreaError}</Text> : null}
+      {manualAreaSuggestions.length > 0 ? (
+        <View style={styles.suggestionsWrap}>
+          {manualAreaSuggestions.map((suggestion) => (
+            <Pressable
+              key={suggestion.id}
+              style={styles.suggestionButton}
+              onPress={() => handleManualSuggestionSelect(suggestion)}
+            >
+              <Text style={styles.suggestionTitle}>{suggestion.label}</Text>
+              {suggestion.primaryType ? (
+                <Text style={styles.suggestionMeta}>{suggestion.primaryType.replace(/_/g, " ")}</Text>
+              ) : null}
+            </Pressable>
+          ))}
         </View>
-      ) : (
-        <>
-          <Text style={styles.controlLabel}>Neighborhood</Text>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.chipRow}>
-            {neighborhoods.map((option) => {
-              const selected = option === selectedNeighborhood;
-              return (
-                <Pressable
-                  key={option}
-                  style={[styles.chip, selected && styles.chipSelected]}
-                  onPress={() => setSelectedNeighborhood(option)}
-                >
-                  <Text style={[styles.chipText, selected && styles.chipTextSelected]}>{option}</Text>
-                </Pressable>
-              );
-            })}
-          </ScrollView>
-        </>
-      )}
+      ) : null}
+
+      <Text style={styles.controlLabel}>Radius</Text>
+      <View style={styles.radiusPanel}>
+        <View style={styles.radiusHeaderRow}>
+          <Text style={styles.radiusValue}>Within {selectedRadiusMiles.toFixed(1)} mi</Text>
+          <Text style={styles.radiusHint}>Distance from your search center</Text>
+        </View>
+        <Slider
+          style={styles.radiusSlider}
+          minimumValue={1}
+          maximumValue={15}
+          step={0.5}
+          value={selectedRadiusMiles}
+          onValueChange={(value) => setSelectedRadiusMiles(Number(value.toFixed(1)))}
+          minimumTrackTintColor={PALETTE.coral}
+          maximumTrackTintColor="rgba(247, 242, 233, 0.32)"
+          thumbTintColor={PALETTE.peach}
+        />
+        <View style={styles.radiusScaleRow}>
+          <Text style={styles.radiusScaleText}>1 mi</Text>
+          <Text style={styles.radiusScaleText}>8 mi</Text>
+          <Text style={styles.radiusScaleText}>15 mi</Text>
+        </View>
+      </View>
 
       <Text style={styles.controlLabel}>Vibe</Text>
       <View style={styles.inlineRow}>
@@ -875,7 +1160,7 @@ export default function App() {
         })}
       </View>
 
-      <Text style={styles.controlLabel}>Budget cap for two</Text>
+      <Text style={styles.controlLabel}>Budget Cap For Two</Text>
       <View style={styles.budgetRow}>
         {BUDGET_TIERS.map((tier) => {
           const selected = tier === selectedBudget;
@@ -886,9 +1171,7 @@ export default function App() {
               style={[styles.budgetCard, selected && styles.budgetCardSelected]}
               onPress={() => setSelectedBudget(tier)}
             >
-              <Text style={[styles.budgetTitle, selected && styles.budgetTitleSelected]}>
-                {budget.title}
-              </Text>
+              <Text style={[styles.budgetTitle, selected && styles.budgetTitleSelected]}>{budget.title}</Text>
               {budget.subtitle ? (
                 <Text style={[styles.budgetSubtitle, selected && styles.budgetSubtitleSelected]}>
                   {budget.subtitle}
@@ -910,9 +1193,7 @@ export default function App() {
               style={[styles.timeCard, selected && styles.timeCardSelected]}
               onPress={() => setSelectedTime(key)}
             >
-              <Text style={[styles.timeLabel, selected && styles.timeLabelSelected]}>
-                {TIME_OPTIONS[key].label}
-              </Text>
+              <Text style={[styles.timeLabel, selected && styles.timeLabelSelected]}>{TIME_OPTIONS[key].label}</Text>
               <Text style={[styles.timeSubLabel, selected && styles.timeSubLabelSelected]}>
                 {TIME_OPTIONS[key].subLabel}
               </Text>
@@ -926,54 +1207,94 @@ export default function App() {
   const DiscoverTab = (
     <View style={styles.tabBody}>
       <Text style={styles.tabIntro}>
-        Ideas for {selectedDateLabel} around {formatClock(selectedStartMinutes)}, tuned to your spend cap and area.
+        Live venues for {selectedDateLabel} around {formatClock(selectedStartMinutes)}, tuned to your spend cap, vibe,
+        and search area.
       </Text>
-      {discoverIdeas.length === 0 ? (
-        <Animated.View style={[styles.emptyState, animatedStyle(animatedValues[0])]}>
+
+      <LinearGradient colors={[PALETTE.panelStrong, PALETTE.panel]} style={styles.discoverStatusCard}>
+        <View style={styles.discoverStatusHeader}>
+          <View style={styles.discoverStatusHeaderCopy}>
+            <Text style={styles.discoverStatusTitle}>{activeAnchorLabel}</Text>
+            <Text style={styles.discoverStatusBody}>
+              {resultsStale
+                ? "Filters changed. Update results to run a fresh Google search."
+                : searchAnchor
+                  ? "Discover is synced with your latest live search."
+                  : currentLocationState === "loading"
+                    ? "Waiting for your current location or a manual area selection."
+                    : "Search another area to start live venue discovery."}
+            </Text>
+          </View>
+          {shouldShowUpdateButton ? (
+            <Pressable style={styles.updateButton} onPress={() => void runDiscoverSearch()}>
+              <Text style={styles.updateButtonText}>Update results</Text>
+            </Pressable>
+          ) : null}
+        </View>
+        {discoverMetaLine ? <Text style={styles.debugMetaText}>{discoverMetaLine}</Text> : null}
+        {discoverError ? <Text style={styles.errorText}>{discoverError}</Text> : null}
+      </LinearGradient>
+
+      {isDiscoverLoading && discoverVenues.length === 0 ? (
+        <Animated.View style={[styles.emptyState, animatedStyle(animatedValues[0]!)]}>
+          <ActivityIndicator size="small" color={PALETTE.deep} />
+          <Text style={styles.emptyTitle}>Pulling live venues</Text>
+          <Text style={styles.emptyBody}>We are searching nearby places that fit your current date setup.</Text>
+        </Animated.View>
+      ) : !searchAnchor && currentLocationState !== "loading" ? (
+        <Animated.View style={[styles.emptyState, animatedStyle(animatedValues[0]!)]}>
+          <Ionicons name="navigate-outline" size={26} color={PALETTE.deep} />
+          <Text style={styles.emptyTitle}>Pick a search area to begin</Text>
+          <Text style={styles.emptyBody}>Use current location or search another area above for live venue discovery.</Text>
+        </Animated.View>
+      ) : hasCompletedDiscoverSearch && discoverVenues.length === 0 && !isDiscoverLoading ? (
+        <Animated.View style={[styles.emptyState, animatedStyle(animatedValues[0]!)]}>
           <Ionicons name="search-outline" size={26} color={PALETTE.deep} />
-          <Text style={styles.emptyTitle}>No exact matches for this plan</Text>
-          <Text style={styles.emptyBody}>Try widening area or adjusting date, time, spend range, and vibe.</Text>
+          <Text style={styles.emptyTitle}>No live matches yet</Text>
+          <Text style={styles.emptyBody}>Try widening the radius or shifting budget, vibe, or time before updating results.</Text>
         </Animated.View>
       ) : (
-        discoverIdeas.map((idea, index) => {
-          const isSaved = savedIds.includes(idea.id);
+        discoverVenues.map((venue, index) => {
+          const metaItems: string[] = [];
+          if (venue.priceTier) {
+            metaItems.push(formatBudgetRange(venue.priceTier));
+          }
+          if (venue.rating !== undefined) {
+            metaItems.push(`${venue.rating.toFixed(1)}★`);
+          }
+          if (venue.openStatus === "open") {
+            metaItems.push("Open at your time");
+          }
+          metaItems.push(formatVenueEnvironment(venue.environment));
+          metaItems.push(`${venue.distanceMiles.toFixed(1)} mi`);
+
           return (
-            <Animated.View key={idea.id} style={[styles.cardWrap, animatedStyle(animatedValues[index])]}>
+            <Animated.View key={venue.id} style={[styles.cardWrap, animatedStyle(animatedValues[index]!)]}>
               <LinearGradient colors={[PALETTE.panelStrong, PALETTE.panel]} style={styles.ideaCard}>
                 <View style={styles.ideaTopRow}>
                   <View style={styles.ideaBadge}>
-                    <Ionicons name={CATEGORY_ICON[idea.category]} size={14} color={PALETTE.deep} />
-                    <Text style={styles.ideaBadgeText}>{idea.category}</Text>
+                    <Ionicons name={CATEGORY_ICON[venue.category]} size={14} color={PALETTE.deep} />
+                    <Text style={styles.ideaBadgeText}>{venue.category}</Text>
                   </View>
-                  <Pressable style={styles.saveButton} onPress={() => toggleSaved(idea.id)}>
-                    <Ionicons
-                      name={isSaved ? "heart" : "heart-outline"}
-                      size={19}
-                      color={isSaved ? PALETTE.coral : PALETTE.deep}
-                    />
-                  </Pressable>
+                  {venue.openStatus === "open" ? (
+                    <View style={styles.statusPill}>
+                      <Text style={styles.statusPillText}>Open</Text>
+                    </View>
+                  ) : null}
                 </View>
 
-                <Text style={styles.ideaTitle}>{idea.title}</Text>
-                <Text style={styles.ideaVenue}>{idea.venue + " · " + idea.neighborhood}</Text>
-                <Text style={styles.ideaBlurb}>{idea.blurb}</Text>
+                <Text style={styles.ideaTitle}>{venue.name}</Text>
+                <Text style={styles.ideaVenue}>{venue.address}</Text>
+                <Text style={styles.ideaBlurb}>{venue.summary}</Text>
 
                 <View style={styles.metaRow}>
-                  <Text style={styles.metaText}>{formatBudgetRange(idea.cost)}</Text>
-                  <Text style={styles.metaDot}>•</Text>
-                  <Text style={styles.metaText}>{formatMinutes(idea.durationMinutes)}</Text>
-                  <Text style={styles.metaDot}>•</Text>
-                  <Text style={styles.metaText}>{idea.indoor ? "Indoor" : "Outdoor"}</Text>
-                  <Text style={styles.metaDot}>•</Text>
-                  <Text style={styles.metaText}>{idea.distanceMiles.toFixed(1)} mi</Text>
+                  {metaItems.map((item, itemIndex) => (
+                    <React.Fragment key={`${venue.id}-${item}`}>
+                      {itemIndex > 0 ? <Text style={styles.metaDot}>•</Text> : null}
+                      <Text style={styles.metaText}>{item}</Text>
+                    </React.Fragment>
+                  ))}
                 </View>
-
-                {idea.eventTag ? (
-                  <View style={styles.eventTag}>
-                    <Ionicons name="time-outline" size={13} color={PALETTE.ink} />
-                    <Text style={styles.eventTagText}>{idea.eventTag}</Text>
-                  </View>
-                ) : null}
               </LinearGradient>
             </Animated.View>
           );
@@ -985,7 +1306,7 @@ export default function App() {
   const PlanTab = (
     <View style={styles.tabBody}>
       <Text style={styles.tabIntro}>
-        Built itinerary for {selectedDateLabel} at {formatClock(selectedStartMinutes)} with{" "}
+        Built itinerary for {selectedDateLabel} at {formatClock(selectedStartMinutes)} with {" "}
         {TIME_OPTIONS[selectedTime].label.toLowerCase()} pace and the {selectedBudgetLabel} spend cap.
       </Text>
       <Pressable style={styles.shuffleButton} onPress={() => setPlanSeed((current) => current + 1)}>
@@ -994,14 +1315,14 @@ export default function App() {
       </Pressable>
 
       {itinerary.length === 0 ? (
-        <Animated.View style={[styles.emptyState, animatedStyle(animatedValues[0])]}>
+        <Animated.View style={[styles.emptyState, animatedStyle(animatedValues[0]!)]}>
           <Ionicons name="calendar-outline" size={26} color={PALETTE.deep} />
           <Text style={styles.emptyTitle}>Plan could not be assembled</Text>
           <Text style={styles.emptyBody}>Try a longer time window or less strict filters.</Text>
         </Animated.View>
       ) : (
         itinerary.map((stop, index) => (
-          <Animated.View key={stop.id} style={[styles.cardWrap, animatedStyle(animatedValues[index])]}>
+          <Animated.View key={stop.id} style={[styles.cardWrap, animatedStyle(animatedValues[index]!)]}>
             <LinearGradient colors={[PALETTE.panelStrong, PALETTE.panel]} style={styles.planCard}>
               <View style={styles.planHeadRow}>
                 <Text style={styles.planBadge}>{stop.badge}</Text>
@@ -1019,17 +1340,17 @@ export default function App() {
 
   const SavedTab = (
     <View style={styles.tabBody}>
-      <Text style={styles.tabIntro}>Your bookmarked ideas for quick planning later.</Text>
+      <Text style={styles.tabIntro}>Your bookmarked mock ideas for quick planning later.</Text>
 
       {savedIdeas.length === 0 ? (
-        <Animated.View style={[styles.emptyState, animatedStyle(animatedValues[0])]}>
+        <Animated.View style={[styles.emptyState, animatedStyle(animatedValues[0]!)]}>
           <Ionicons name="heart-dislike-outline" size={26} color={PALETTE.deep} />
           <Text style={styles.emptyTitle}>Nothing saved yet</Text>
-          <Text style={styles.emptyBody}>Tap hearts in Discover to build your shortlist.</Text>
+          <Text style={styles.emptyBody}>Tap hearts in your mock shortlist below to build it out.</Text>
         </Animated.View>
       ) : (
         savedIdeas.map((idea, index) => (
-          <Animated.View key={idea.id} style={[styles.cardWrap, animatedStyle(animatedValues[index])]}>
+          <Animated.View key={idea.id} style={[styles.cardWrap, animatedStyle(animatedValues[index]!)]}>
             <LinearGradient colors={[PALETTE.panelStrong, PALETTE.panel]} style={styles.ideaCard}>
               <View style={styles.ideaTopRow}>
                 <View style={styles.ideaBadge}>
@@ -1101,9 +1422,7 @@ export default function App() {
                         style={[styles.tabButton, selected && styles.tabButtonSelected]}
                         onPress={() => handleTabChange(tab)}
                       >
-                        <Text style={[styles.tabButtonText, selected && styles.tabButtonTextSelected]}>
-                          {tab}
-                        </Text>
+                        <Text style={[styles.tabButtonText, selected && styles.tabButtonTextSelected]}>{tab}</Text>
                       </Pressable>
                     );
                   })}
@@ -1294,33 +1613,119 @@ const styles = StyleSheet.create({
     marginBottom: 2,
     fontFamily: FONT?.body
   },
-  locationModeRow: {
-    flexDirection: "row",
-    gap: 8
+  locationCard: {
+    borderRadius: 14,
+    backgroundColor: "rgba(247, 242, 233, 0.1)",
+    borderWidth: 1,
+    borderColor: "rgba(247, 242, 233, 0.22)",
+    paddingVertical: 10,
+    paddingHorizontal: 12
   },
-  locationModeButton: {
+  locationCardHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 7
+  },
+  locationCardTitle: {
     flex: 1,
-    borderRadius: 12,
+    color: PALETTE.ink,
+    fontSize: 14,
+    fontFamily: FONT?.subtitle
+  },
+  locationCardBody: {
+    marginTop: 6,
+    color: "rgba(23, 33, 43, 0.76)",
+    fontSize: 12,
+    lineHeight: 17,
+    fontFamily: FONT?.body
+  },
+  secondaryButton: {
+    marginTop: 10,
+    alignSelf: "flex-start",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderRadius: 999,
+    backgroundColor: "rgba(255, 255, 255, 0.58)",
+    borderWidth: 1,
+    borderColor: "rgba(29, 53, 87, 0.16)",
+    paddingVertical: 6,
+    paddingHorizontal: 10
+  },
+  secondaryButtonText: {
+    color: PALETTE.ink,
+    fontSize: 12,
+    fontFamily: FONT?.subtitle
+  },
+  searchRow: {
+    flexDirection: "row",
+    gap: 8,
+    alignItems: "center"
+  },
+  searchInput: {
+    flex: 1,
+    borderRadius: 14,
     borderWidth: 1,
     borderColor: "rgba(247, 242, 233, 0.25)",
     backgroundColor: "rgba(247, 242, 233, 0.08)",
-    paddingVertical: 8,
-    alignItems: "center"
+    color: PALETTE.cream,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 14,
+    fontFamily: FONT?.body
   },
-  locationModeButtonSelected: {
+  searchButton: {
+    minWidth: 88,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
     backgroundColor: PALETTE.mint,
+    borderWidth: 1,
     borderColor: PALETTE.mint
   },
-  locationModeButtonText: {
+  searchButtonDisabled: {
+    opacity: 0.7
+  },
+  searchButtonText: {
+    color: PALETTE.ink,
+    fontSize: 12,
+    fontFamily: FONT?.subtitle
+  },
+  suggestionsWrap: {
+    marginTop: 8,
+    gap: 8
+  },
+  suggestionButton: {
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "rgba(247, 242, 233, 0.22)",
+    backgroundColor: "rgba(247, 242, 233, 0.1)",
+    paddingVertical: 10,
+    paddingHorizontal: 12
+  },
+  suggestionTitle: {
     color: PALETTE.cream,
     fontSize: 12,
     fontFamily: FONT?.subtitle
   },
-  locationModeButtonTextSelected: {
-    color: PALETTE.ink
+  suggestionMeta: {
+    marginTop: 4,
+    color: "rgba(247, 242, 233, 0.7)",
+    fontSize: 11,
+    textTransform: "capitalize",
+    fontFamily: FONT?.body
+  },
+  errorText: {
+    marginTop: 8,
+    color: "#FFD7CA",
+    fontSize: 11,
+    lineHeight: 16,
+    fontFamily: FONT?.body
   },
   radiusPanel: {
-    marginTop: 10,
+    marginTop: 4,
     borderRadius: 14,
     borderWidth: 1,
     borderColor: "rgba(247, 242, 233, 0.22)",
@@ -1358,30 +1763,6 @@ const styles = StyleSheet.create({
     color: "rgba(247, 242, 233, 0.72)",
     fontSize: 11,
     fontFamily: FONT?.body
-  },
-  chipRow: {
-    gap: 8,
-    paddingRight: 8
-  },
-  chip: {
-    borderRadius: 999,
-    paddingVertical: 6,
-    paddingHorizontal: 11,
-    borderWidth: 1,
-    borderColor: "rgba(247, 242, 233, 0.25)",
-    backgroundColor: "rgba(247, 242, 233, 0.08)"
-  },
-  chipSelected: {
-    backgroundColor: PALETTE.mint,
-    borderColor: PALETTE.mint
-  },
-  chipText: {
-    color: PALETTE.cream,
-    fontSize: 12,
-    fontFamily: FONT?.subtitle
-  },
-  chipTextSelected: {
-    color: PALETTE.ink
   },
   inlineRow: {
     flexDirection: "row",
@@ -1543,6 +1924,53 @@ const styles = StyleSheet.create({
     marginBottom: 10,
     fontFamily: FONT?.body
   },
+  discoverStatusCard: {
+    borderRadius: 18,
+    padding: 14,
+    borderWidth: 1,
+    borderColor: "rgba(29, 53, 87, 0.12)",
+    marginBottom: 10
+  },
+  discoverStatusHeader: {
+    flexDirection: "row",
+    gap: 10,
+    alignItems: "flex-start",
+    justifyContent: "space-between"
+  },
+  discoverStatusHeaderCopy: {
+    flex: 1,
+    gap: 4
+  },
+  discoverStatusTitle: {
+    color: PALETTE.ink,
+    fontSize: 16,
+    fontFamily: FONT?.subtitle
+  },
+  discoverStatusBody: {
+    color: PALETTE.mutedInk,
+    fontSize: 12,
+    lineHeight: 17,
+    fontFamily: FONT?.body
+  },
+  updateButton: {
+    borderRadius: 12,
+    backgroundColor: PALETTE.coral,
+    paddingVertical: 9,
+    paddingHorizontal: 12,
+    alignSelf: "center"
+  },
+  updateButtonText: {
+    color: PALETTE.cream,
+    fontSize: 12,
+    fontFamily: FONT?.subtitle
+  },
+  debugMetaText: {
+    marginTop: 8,
+    color: PALETTE.deep,
+    fontSize: 11,
+    lineHeight: 16,
+    fontFamily: FONT?.body
+  },
   cardWrap: {
     marginBottom: 10
   },
@@ -1571,6 +1999,19 @@ const styles = StyleSheet.create({
   },
   ideaBadgeText: {
     color: PALETTE.deep,
+    fontSize: 11,
+    fontFamily: FONT?.subtitle
+  },
+  statusPill: {
+    borderRadius: 999,
+    backgroundColor: "rgba(188, 233, 223, 0.7)",
+    borderWidth: 1,
+    borderColor: "rgba(29, 53, 87, 0.12)",
+    paddingHorizontal: 8,
+    paddingVertical: 4
+  },
+  statusPillText: {
+    color: PALETTE.ink,
     fontSize: 11,
     fontFamily: FONT?.subtitle
   },
@@ -1617,24 +2058,6 @@ const styles = StyleSheet.create({
     marginHorizontal: 7,
     color: "rgba(38, 69, 111, 0.45)",
     fontSize: 12
-  },
-  eventTag: {
-    marginTop: 10,
-    alignSelf: "flex-start",
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "rgba(23, 33, 43, 0.16)",
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    backgroundColor: "rgba(246, 181, 127, 0.35)"
-  },
-  eventTagText: {
-    color: PALETTE.ink,
-    fontSize: 11,
-    fontFamily: FONT?.subtitle
   },
   shuffleButton: {
     alignSelf: "flex-start",
@@ -1702,16 +2125,16 @@ const styles = StyleSheet.create({
     padding: 20,
     alignItems: "center",
     borderWidth: 1,
-    borderColor: "rgba(29, 53, 87, 0.12)"
+    borderColor: "rgba(29, 53, 87, 0.12)",
+    gap: 6
   },
   emptyTitle: {
-    marginTop: 8,
+    marginTop: 4,
     color: PALETTE.ink,
     fontSize: 17,
     fontFamily: FONT?.subtitle
   },
   emptyBody: {
-    marginTop: 4,
     color: PALETTE.mutedInk,
     fontSize: 12,
     textAlign: "center",
