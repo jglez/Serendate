@@ -154,6 +154,7 @@ app.post("/api/venues/search", async (request, reply): Promise<VenueSearchRespon
       vibe: parsed.data.vibe,
       time_commitment: parsed.data.timeCommitment,
       broad_candidates_total: result.diagnostics.broad_candidates_total,
+      eligible_broad_candidates_total: result.diagnostics.eligible_broad_candidates_total,
       finalists_enriched_total: result.diagnostics.finalists_enriched_total,
       venues_returned_total: result.diagnostics.venues_returned_total,
       broad_from_cache: result.diagnostics.broad_from_cache,
@@ -161,6 +162,8 @@ app.post("/api/venues/search", async (request, reply): Promise<VenueSearchRespon
       details_cache_misses: result.diagnostics.details_cache_misses,
       rejected_budget_total: result.diagnostics.rejected_budget_total,
       rejected_closed_total: result.diagnostics.rejected_closed_total,
+      rejected_ineligible_primary_type_total: result.diagnostics.rejected_ineligible_primary_type_total,
+      rejected_missing_primary_type_total: result.diagnostics.rejected_missing_primary_type_total,
       dropped_before_details_total: result.diagnostics.dropped_before_details_total,
       dropped_after_exact_ranking_total: result.diagnostics.dropped_after_exact_ranking_total
     });
@@ -171,6 +174,15 @@ app.post("/api/venues/search", async (request, reply): Promise<VenueSearchRespon
       duration_ms: durationMs,
       candidates: result.diagnostics.candidates
     });
+
+    if (Object.keys(result.diagnostics.rejected_primary_types).length > 0) {
+      request.log.debug({
+        event: "discover_rejected_primary_types",
+        request_id: request.id,
+        duration_ms: durationMs,
+        rejected_primary_types: result.diagnostics.rejected_primary_types
+      });
+    }
 
     if (
       result.diagnostics.broad_candidates_total > 0 &&
@@ -189,7 +201,9 @@ app.post("/api/venues/search", async (request, reply): Promise<VenueSearchRespon
         broad_candidates_total: result.diagnostics.broad_candidates_total,
         finalists_enriched_total: result.diagnostics.finalists_enriched_total,
         rejected_budget_total: result.diagnostics.rejected_budget_total,
-        rejected_closed_total: result.diagnostics.rejected_closed_total
+        rejected_closed_total: result.diagnostics.rejected_closed_total,
+        rejected_ineligible_primary_type_total: result.diagnostics.rejected_ineligible_primary_type_total,
+        rejected_missing_primary_type_total: result.diagnostics.rejected_missing_primary_type_total
       });
     }
 

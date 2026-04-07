@@ -1,7 +1,6 @@
 import type {
   BudgetTier,
   EnvironmentPreference,
-  SearchAnchor,
   TimeCommitment,
   VenueCategory,
   VenueEnvironment,
@@ -52,6 +51,7 @@ export interface CandidateDiagnostic {
 
 export interface SearchDiagnostics {
   broad_candidates_total: number;
+  eligible_broad_candidates_total: number;
   finalists_enriched_total: number;
   venues_returned_total: number;
   broad_from_cache: boolean;
@@ -59,6 +59,9 @@ export interface SearchDiagnostics {
   details_cache_misses: number;
   rejected_budget_total: number;
   rejected_closed_total: number;
+  rejected_ineligible_primary_type_total: number;
+  rejected_missing_primary_type_total: number;
+  rejected_primary_types: Record<string, number>;
   dropped_before_details_total: number;
   dropped_after_exact_ranking_total: number;
   candidates: CandidateDiagnostic[];
@@ -69,6 +72,7 @@ export interface VenueSearchResult {
   diagnostics: SearchDiagnostics;
 }
 
+// Hard backend eligibility gate for Discover venues
 const TYPE_PROFILES: Record<string, TypeProfile> = {
   restaurant: buildProfile("Food", "indoor", ["Cozy", "Playful"], 1),
   cafe: buildProfile("Food", "indoor", ["Cozy", "Artsy"], 0.94),
@@ -89,14 +93,6 @@ const TYPE_PROFILES: Record<string, TypeProfile> = {
   book_store: buildProfile("Shopping", "indoor", ["Artsy", "Cozy"], 0.78)
 };
 
-const UNKNOWN_PROFILE: TypeProfile = {
-  known: false,
-  category: "Unknown",
-  environment: "unknown",
-  vibes: [],
-  categoryQuality: 0.38
-};
-
 const QUICK_TYPES = new Set(["cafe", "coffee_shop", "bar", "bakery", "dessert_shop", "book_store"]);
 const LINGER_TYPES = new Set([
   "restaurant",
@@ -114,9 +110,42 @@ export class VenueSearchService {
   constructor(private readonly google: GooglePlacesClient) {}
 
   async search(request: VenueSearchRequest): Promise<VenueSearchResult> {
+    assertDiscoverTypeConfig();
+
     const broadResult = await this.google.searchNearby(request.anchor, request.radiusMiles);
-    const broadCandidates = broadResult.places
-      .map((place) => buildBroadCandidate(place, request.anchor, request))
+    let rejectedIneligiblePrimaryTypeTotal = 0;
+    let rejectedMissingPrimaryTypeTotal = 0;
+    const rejectedPrimaryTypes: Record<string, number> = {};
+    const candidateDiagnostics: CandidateDiagnostic[] = [];
+
+    const eligibleBroadPlaces = broadResult.places.filter((place) => {
+      if (!place.primaryType) {
+        rejectedMissingPrimaryTypeTotal += 1;
+        incrementRejectedPrimaryTypeBucket(rejectedPrimaryTypes, "(missing)");
+        candidateDiagnostics.push({
+          place_id: place.id,
+          name: place.name,
+          stage: "rejected"
+        });
+        return false;
+      }
+
+      if (!isEligiblePrimaryType(place.primaryType)) {
+        rejectedIneligiblePrimaryTypeTotal += 1;
+        incrementRejectedPrimaryTypeBucket(rejectedPrimaryTypes, place.primaryType);
+        candidateDiagnostics.push({
+          place_id: place.id,
+          name: place.name,
+          stage: "rejected"
+        });
+        return false;
+      }
+
+      return true;
+    });
+
+    const broadCandidates = eligibleBroadPlaces
+      .map((place) => buildBroadCandidate(place, request))
       .sort((left, right) => right.cheapScore - left.cheapScore);
 
     const finalists = broadCandidates.slice(0, 8);
@@ -124,14 +153,16 @@ export class VenueSearchService {
     let detailsCacheMisses = 0;
     let rejectedBudgetTotal = 0;
     let rejectedClosedTotal = 0;
-    const candidateDiagnostics: CandidateDiagnostic[] = broadCandidates
-      .slice(8)
-      .map((candidate) => ({
-        place_id: candidate.place.id,
-        name: candidate.place.name,
-        stage: "broad_only",
-        reason: "shortlist_cutoff"
-      }));
+    candidateDiagnostics.push(
+      ...broadCandidates.slice(8).map(
+        (candidate): CandidateDiagnostic => ({
+          place_id: candidate.place.id,
+          name: candidate.place.name,
+          stage: "broad_only",
+          reason: "shortlist_cutoff"
+        })
+      )
+    );
 
     const enriched = await Promise.all(
       finalists.map(async (candidate) => {
@@ -210,6 +241,7 @@ export class VenueSearchService {
       venues,
       diagnostics: {
         broad_candidates_total: broadCandidates.length,
+        eligible_broad_candidates_total: broadCandidates.length,
         finalists_enriched_total: finalists.length,
         venues_returned_total: venues.length,
         broad_from_cache: broadResult.fromCache,
@@ -217,6 +249,9 @@ export class VenueSearchService {
         details_cache_misses: detailsCacheMisses,
         rejected_budget_total: rejectedBudgetTotal,
         rejected_closed_total: rejectedClosedTotal,
+        rejected_ineligible_primary_type_total: rejectedIneligiblePrimaryTypeTotal,
+        rejected_missing_primary_type_total: rejectedMissingPrimaryTypeTotal,
+        rejected_primary_types: rejectedPrimaryTypes,
         dropped_before_details_total: Math.max(broadCandidates.length - finalists.length, 0),
         dropped_after_exact_ranking_total: droppedAfterExactRanking.length,
         candidates: candidateDiagnostics
@@ -240,13 +275,14 @@ function buildProfile(
   };
 }
 
-function buildBroadCandidate(
-  place: BroadPlace,
-  anchor: SearchAnchor,
-  request: VenueSearchRequest
-): BroadCandidate {
-  const profile = getTypeProfile(place.primaryType);
-  const distanceMiles = haversineMiles(anchor.latitude, anchor.longitude, place.latitude, place.longitude);
+function buildBroadCandidate(place: BroadPlace, request: VenueSearchRequest): BroadCandidate {
+  const profile = TYPE_PROFILES[place.primaryType!]!;
+  const distanceMiles = haversineMiles(
+    request.anchor.latitude,
+    request.anchor.longitude,
+    place.latitude,
+    place.longitude
+  );
 
   let cheapScore = 0;
   cheapScore += Math.max(0, request.radiusMiles - distanceMiles) * 1.4;
@@ -254,8 +290,6 @@ function buildBroadCandidate(
   cheapScore += environmentFitScore(profile.environment, request.environment);
   cheapScore += profile.vibes.includes(request.vibe) ? 4 : 0;
   cheapScore += timeCommitmentScore(place.primaryType, request.timeCommitment);
-  cheapScore += profile.known ? 0 : -2.5;
-
   return {
     place,
     profile,
@@ -404,12 +438,24 @@ function capitalize(value: string): string {
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
-function getTypeProfile(primaryType?: string): TypeProfile {
-  if (!primaryType) {
-    return UNKNOWN_PROFILE;
-  }
+function isEligiblePrimaryType(primaryType?: string): primaryType is keyof typeof TYPE_PROFILES {
+  return Boolean(primaryType && primaryType in TYPE_PROFILES);
+}
 
-  return TYPE_PROFILES[primaryType] ?? UNKNOWN_PROFILE;
+function assertDiscoverTypeConfig(): void {
+  const profileKeys = Object.keys(TYPE_PROFILES).sort();
+  const includedTypes = [...GooglePlacesClient.getIncludedGoogleTypes()].sort();
+
+  if (
+    profileKeys.length !== includedTypes.length ||
+    profileKeys.some((key, index) => key !== includedTypes[index])
+  ) {
+    throw new Error("Discover venue type config drifted: TYPE_PROFILES keys must match INCLUDED_GOOGLE_TYPES.");
+  }
+}
+
+function incrementRejectedPrimaryTypeBucket(buckets: Record<string, number>, key: string): void {
+  buckets[key] = (buckets[key] ?? 0) + 1;
 }
 
 function environmentFitScore(

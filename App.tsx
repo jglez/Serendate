@@ -712,7 +712,7 @@ export default function App() {
       });
 
       const [onlySuggestion] = response.suggestions;
-      if (onlySuggestion) {
+      if (response.suggestions.length === 1 && onlySuggestion) {
         applyManualSuggestion(onlySuggestion, true);
         return;
       }

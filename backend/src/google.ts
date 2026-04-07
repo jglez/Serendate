@@ -10,6 +10,7 @@ const NEARBY_SEARCH_FIELD_MASK =
 const PLACE_DETAILS_FIELD_MASK =
   "priceLevel,rating,userRatingCount,currentOpeningHours,regularOpeningHours";
 
+// Our allowlist for venues. It's our upstream pre-filter.
 export const INCLUDED_GOOGLE_TYPES = [
   "restaurant",
   "cafe",
@@ -107,6 +108,10 @@ export class GooglePlacesClient {
   private readonly detailsCache = new MemoryCache<PlaceDetails | null>();
 
   constructor(private readonly config: AppConfig) {}
+
+  static getIncludedGoogleTypes(): readonly string[] {
+    return INCLUDED_GOOGLE_TYPES;
+  }
 
   async searchText(query: string, limit: number): Promise<BroadPlace[]> {
     const payload = {
