@@ -404,9 +404,8 @@ function buildItinerary(
       title: idea.title,
       venue: `${idea.venue} · ${idea.neighborhood}`,
       timeRange: `${formatClock(start)} - ${formatClock(end)}`,
-      note: `${formatBudgetRange(idea.cost)} · ${formatMinutes(idea.durationMinutes)} · ${
-        idea.indoor ? "Indoor" : "Outdoor"
-      }`,
+      note: `${formatBudgetRange(idea.cost)} · ${formatMinutes(idea.durationMinutes)} · ${idea.indoor ? "Indoor" : "Outdoor"
+        }`,
       badge: idea.category
     });
 
@@ -486,6 +485,7 @@ export default function App() {
   const [manualAreaQuery, setManualAreaQuery] = useState("");
   const [manualAreaSuggestions, setManualAreaSuggestions] = useState<LocationSuggestion[]>([]);
   const [manualAreaError, setManualAreaError] = useState<string | null>(null);
+  const [manualAreaNotice, setManualAreaNotice] = useState<string | null>(null);
   const [isManualAreaLoading, setIsManualAreaLoading] = useState(false);
 
   const [discoverVenues, setDiscoverVenues] = useState<VenueSummary[]>([]);
@@ -551,6 +551,8 @@ export default function App() {
   const selectedDateLabel = formatDateLabel(selectedDate);
   const selectedBudgetLabel = formatBudgetSelection(selectedBudget);
   const activeAnchorLabel = formatAnchorLabel(searchAnchor);
+  const manualAreaHelpText =
+    manualAreaSuggestions.length > 1 ? "Search, then tap a result below" : "Search by neighborhood, address, or city";
   const shouldShowUpdateButton =
     Boolean(searchAnchor) && (resultsStale || Boolean(discoverError) || (!hasCompletedDiscoverSearch && !isDiscoverLoading));
 
@@ -654,22 +656,48 @@ export default function App() {
     }
   }, [discoverRequest, discoverRequestKey]);
 
+  const applyManualSuggestion = useCallback((suggestion: LocationSuggestion, shouldShowNotice = false) => {
+    const nextAnchor: SearchAnchor = {
+      latitude: suggestion.latitude,
+      longitude: suggestion.longitude,
+      label: suggestion.label,
+      source: "manual"
+    };
+
+    setSearchAnchor(nextAnchor);
+    setManualAreaQuery(suggestion.label);
+    setManualAreaSuggestions([]);
+    setManualAreaError(null);
+    setManualAreaNotice(shouldShowNotice ? `Using ${suggestion.label.replace(/\s·\s/g, ", ")}` : null);
+    setDiscoverError(null);
+    setResultsStale(false);
+    setAutoSearchTrigger((current) => current + 1);
+  }, []);
+
   const handleManualAreaSearch = useCallback(async () => {
     const query = manualAreaQuery.trim();
     if (query.length < 3) {
       setManualAreaError("Enter at least 3 characters before searching another area.");
       setManualAreaSuggestions([]);
+      setManualAreaNotice(null);
       return;
     }
 
     setIsManualAreaLoading(true);
     setManualAreaError(null);
+    setManualAreaNotice(null);
 
     try {
       const response = await searchAreas({
         query,
         limit: 5
       });
+
+      const [onlySuggestion] = response.suggestions;
+      if (onlySuggestion) {
+        applyManualSuggestion(onlySuggestion, true);
+        return;
+      }
 
       setManualAreaSuggestions(response.suggestions);
 
@@ -682,24 +710,11 @@ export default function App() {
     } finally {
       setIsManualAreaLoading(false);
     }
-  }, [manualAreaQuery]);
+  }, [applyManualSuggestion, manualAreaQuery]);
 
   const handleManualSuggestionSelect = useCallback((suggestion: LocationSuggestion) => {
-    const nextAnchor: SearchAnchor = {
-      latitude: suggestion.latitude,
-      longitude: suggestion.longitude,
-      label: suggestion.label,
-      source: "manual"
-    };
-
-    setSearchAnchor(nextAnchor);
-    setManualAreaQuery(suggestion.label);
-    setManualAreaSuggestions([]);
-    setManualAreaError(null);
-    setDiscoverError(null);
-    setResultsStale(false);
-    setAutoSearchTrigger((current) => current + 1);
-  }, []);
+    applyManualSuggestion(suggestion);
+  }, [applyManualSuggestion]);
 
   const handleUseCurrentLocation = useCallback(() => {
     if (!deviceAnchor) {
@@ -709,6 +724,7 @@ export default function App() {
     setSearchAnchor(deviceAnchor);
     setManualAreaSuggestions([]);
     setManualAreaError(null);
+    setManualAreaNotice(null);
     setDiscoverError(null);
     setResultsStale(false);
     setAutoSearchTrigger((current) => current + 1);
@@ -1044,6 +1060,7 @@ export default function App() {
           onChangeText={(value) => {
             setManualAreaQuery(value);
             setManualAreaSuggestions([]);
+            setManualAreaNotice(null);
             if (manualAreaError) {
               setManualAreaError(null);
             }
@@ -1071,7 +1088,8 @@ export default function App() {
           )}
         </Pressable>
       </View>
-      <Text style={styles.controlHelpText}>Submit-based only to keep venue search cheap and intentional.</Text>
+      <Text style={styles.controlHelpText}>{manualAreaHelpText}</Text>
+      {manualAreaNotice ? <Text style={styles.noticeText}>{manualAreaNotice}</Text> : null}
       {manualAreaError ? <Text style={styles.errorText}>{manualAreaError}</Text> : null}
       {manualAreaSuggestions.length > 0 ? (
         <View style={styles.suggestionsWrap}>
@@ -1684,6 +1702,13 @@ const styles = StyleSheet.create({
     color: "rgba(247, 242, 233, 0.7)",
     fontSize: 11,
     textTransform: "capitalize",
+    fontFamily: FONT?.body
+  },
+  noticeText: {
+    marginTop: 8,
+    color: "rgba(188, 233, 223, 0.96)",
+    fontSize: 11,
+    lineHeight: 16,
     fontFamily: FONT?.body
   },
   errorText: {
