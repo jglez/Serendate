@@ -456,6 +456,15 @@ function formatAnchorLabel(anchor: SearchAnchor | null): string {
   return anchor.label ?? (anchor.source === "device" ? "Current location" : "Manual area");
 }
 
+function formatManualAreaPillLabel(label?: string): string {
+  if (!label) {
+    return "Custom area";
+  }
+
+  const [primaryLabel] = label.split(" · ");
+  return primaryLabel || "Custom area";
+}
+
 export default function App() {
   const [activeTab, setActiveTab] = useState<TabKey>("Discover");
   const [pendingTab, setPendingTab] = useState<TabKey | null>(null);
@@ -496,6 +505,7 @@ export default function App() {
   const [autoSearchTrigger, setAutoSearchTrigger] = useState(0);
 
   const scrollViewRef = useRef<ScrollView>(null);
+  const searchAreaTopRef = useRef<number | null>(null);
   const tabSectionTopRef = useRef<number | null>(null);
   const currentScrollYRef = useRef(0);
   const tabSwitchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -551,6 +561,14 @@ export default function App() {
   const selectedDateLabel = formatDateLabel(selectedDate);
   const selectedBudgetLabel = formatBudgetSelection(selectedBudget);
   const activeAnchorLabel = formatAnchorLabel(searchAnchor);
+  const locationPillLabel =
+    searchAnchor?.source === "manual"
+      ? formatManualAreaPillLabel(searchAnchor.label)
+      : currentLocationState === "loading"
+        ? "Locating..."
+        : currentLocationState === "granted"
+          ? "Near you"
+          : "Pick area";
   const manualAreaHelpText =
     manualAreaSuggestions.length > 1 ? "Search, then tap a result below" : "Search by neighborhood, address, or city";
   const shouldShowUpdateButton =
@@ -729,6 +747,17 @@ export default function App() {
     setResultsStale(false);
     setAutoSearchTrigger((current) => current + 1);
   }, [deviceAnchor]);
+
+  const handleScrollToSearchArea = useCallback(() => {
+    if (searchAreaTopRef.current === null) {
+      return;
+    }
+
+    scrollViewRef.current?.scrollTo({
+      y: Math.max(searchAreaTopRef.current - 12, 0),
+      animated: true
+    });
+  }, []);
 
   useEffect(() => {
     let isCancelled = false;
@@ -1036,77 +1065,83 @@ export default function App() {
         Planning for {selectedDateLabel} at {formatClock(selectedStartMinutes)}
       </Text>
 
-      <Text style={styles.controlLabel}>Search Area</Text>
-      <View style={styles.locationCard}>
-        <View style={styles.locationCardHeader}>
-          <Ionicons name="navigate-outline" size={16} color={PALETTE.ink} />
-          <Text style={styles.locationCardTitle}>{activeAnchorLabel}</Text>
+      <View
+        onLayout={(event) => {
+          searchAreaTopRef.current = event.nativeEvent.layout.y;
+        }}
+      >
+        <Text style={styles.controlLabel}>Search Area</Text>
+        <View style={styles.locationCard}>
+          <View style={styles.locationCardHeader}>
+            <Ionicons name="navigate-outline" size={16} color={PALETTE.ink} />
+            <Text style={styles.locationCardTitle}>{activeAnchorLabel}</Text>
+          </View>
+          <Text style={styles.locationCardBody}>
+            {searchAnchor?.source === "manual" ? "Manual area override is active for Discover." : locationStatusMessage}
+          </Text>
+          {deviceAnchor && searchAnchor?.source === "manual" ? (
+            <Pressable style={styles.secondaryButton} onPress={handleUseCurrentLocation}>
+              <Ionicons name="locate-outline" size={14} color={PALETTE.ink} />
+              <Text style={styles.secondaryButtonText}>Use current location</Text>
+            </Pressable>
+          ) : null}
         </View>
-        <Text style={styles.locationCardBody}>
-          {searchAnchor?.source === "manual" ? "Manual area override is active for Discover." : locationStatusMessage}
-        </Text>
-        {deviceAnchor && searchAnchor?.source === "manual" ? (
-          <Pressable style={styles.secondaryButton} onPress={handleUseCurrentLocation}>
-            <Ionicons name="locate-outline" size={14} color={PALETTE.ink} />
-            <Text style={styles.secondaryButtonText}>Use current location</Text>
+
+        <Text style={styles.controlLabel}>Search Another Area</Text>
+        <View style={styles.searchRow}>
+          <TextInput
+            value={manualAreaQuery}
+            onChangeText={(value) => {
+              setManualAreaQuery(value);
+              setManualAreaSuggestions([]);
+              setManualAreaNotice(null);
+              if (manualAreaError) {
+                setManualAreaError(null);
+              }
+            }}
+            onSubmitEditing={() => {
+              void handleManualAreaSearch();
+            }}
+            placeholder="Neighborhood, district, or address"
+            placeholderTextColor="rgba(247, 242, 233, 0.46)"
+            style={styles.searchInput}
+            autoCapitalize="words"
+            returnKeyType="search"
+          />
+          <Pressable
+            style={[styles.searchButton, isManualAreaLoading && styles.searchButtonDisabled]}
+            onPress={() => {
+              void handleManualAreaSearch();
+            }}
+            disabled={isManualAreaLoading}
+          >
+            {isManualAreaLoading ? (
+              <ActivityIndicator size="small" color={PALETTE.ink} />
+            ) : (
+              <Text style={styles.searchButtonText}>Search</Text>
+            )}
           </Pressable>
+        </View>
+        <Text style={styles.controlHelpText}>{manualAreaHelpText}</Text>
+        {manualAreaNotice ? <Text style={styles.noticeText}>{manualAreaNotice}</Text> : null}
+        {manualAreaError ? <Text style={styles.errorText}>{manualAreaError}</Text> : null}
+        {manualAreaSuggestions.length > 0 ? (
+          <View style={styles.suggestionsWrap}>
+            {manualAreaSuggestions.map((suggestion) => (
+              <Pressable
+                key={suggestion.id}
+                style={styles.suggestionButton}
+                onPress={() => handleManualSuggestionSelect(suggestion)}
+              >
+                <Text style={styles.suggestionTitle}>{suggestion.label}</Text>
+                {suggestion.primaryType ? (
+                  <Text style={styles.suggestionMeta}>{suggestion.primaryType.replace(/_/g, " ")}</Text>
+                ) : null}
+              </Pressable>
+            ))}
+          </View>
         ) : null}
       </View>
-
-      <Text style={styles.controlLabel}>Search Another Area</Text>
-      <View style={styles.searchRow}>
-        <TextInput
-          value={manualAreaQuery}
-          onChangeText={(value) => {
-            setManualAreaQuery(value);
-            setManualAreaSuggestions([]);
-            setManualAreaNotice(null);
-            if (manualAreaError) {
-              setManualAreaError(null);
-            }
-          }}
-          onSubmitEditing={() => {
-            void handleManualAreaSearch();
-          }}
-          placeholder="Neighborhood, district, or address"
-          placeholderTextColor="rgba(247, 242, 233, 0.46)"
-          style={styles.searchInput}
-          autoCapitalize="words"
-          returnKeyType="search"
-        />
-        <Pressable
-          style={[styles.searchButton, isManualAreaLoading && styles.searchButtonDisabled]}
-          onPress={() => {
-            void handleManualAreaSearch();
-          }}
-          disabled={isManualAreaLoading}
-        >
-          {isManualAreaLoading ? (
-            <ActivityIndicator size="small" color={PALETTE.ink} />
-          ) : (
-            <Text style={styles.searchButtonText}>Search</Text>
-          )}
-        </Pressable>
-      </View>
-      <Text style={styles.controlHelpText}>{manualAreaHelpText}</Text>
-      {manualAreaNotice ? <Text style={styles.noticeText}>{manualAreaNotice}</Text> : null}
-      {manualAreaError ? <Text style={styles.errorText}>{manualAreaError}</Text> : null}
-      {manualAreaSuggestions.length > 0 ? (
-        <View style={styles.suggestionsWrap}>
-          {manualAreaSuggestions.map((suggestion) => (
-            <Pressable
-              key={suggestion.id}
-              style={styles.suggestionButton}
-              onPress={() => handleManualSuggestionSelect(suggestion)}
-            >
-              <Text style={styles.suggestionTitle}>{suggestion.label}</Text>
-              {suggestion.primaryType ? (
-                <Text style={styles.suggestionMeta}>{suggestion.primaryType.replace(/_/g, " ")}</Text>
-              ) : null}
-            </Pressable>
-          ))}
-        </View>
-      ) : null}
 
       <Text style={styles.controlLabel}>Radius</Text>
       <View style={styles.radiusPanel}>
@@ -1386,10 +1421,12 @@ export default function App() {
                   <Text style={styles.brand}>Serendate</Text>
                   <Text style={styles.tagline}>Date planning with local spark.</Text>
                 </View>
-                <View style={styles.cityPill}>
+                <Pressable style={styles.cityPill} onPress={handleScrollToSearchArea}>
                   <Ionicons name="navigate-outline" size={13} color={PALETTE.cream} />
-                  <Text style={styles.cityPillText}>SF Area</Text>
-                </View>
+                  <Text style={styles.cityPillText} numberOfLines={1} ellipsizeMode="tail">
+                    {locationPillLabel}
+                  </Text>
+                </Pressable>
               </View>
 
               {PlannerHeader}
@@ -1464,6 +1501,9 @@ const styles = StyleSheet.create({
     fontFamily: FONT?.body
   },
   cityPill: {
+    maxWidth: "46%",
+    minWidth: 0,
+    flexShrink: 1,
     borderRadius: 999,
     backgroundColor: "rgba(247, 242, 233, 0.16)",
     borderWidth: 1,
@@ -1475,6 +1515,8 @@ const styles = StyleSheet.create({
     gap: 5
   },
   cityPillText: {
+    flexShrink: 1,
+    minWidth: 0,
     color: PALETTE.cream,
     fontSize: 12,
     fontFamily: FONT?.subtitle
