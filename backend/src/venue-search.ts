@@ -385,23 +385,72 @@ function toVenueSummary(candidate: EnrichedCandidate, request: VenueSearchReques
     rating: candidate.rating,
     ratingCount: candidate.ratingCount,
     openStatus: candidate.openStatus,
-    summary: buildSummary(candidate, request)
+    description: buildDescription(candidate),
+    matchExplanation: buildMatchExplanation(candidate, request)
   };
 }
 
-function buildSummary(candidate: EnrichedCandidate, request: VenueSearchRequest): string {
-  const parts: string[] = [];
-
-  if (candidate.profile.vibes.includes(request.vibe)) {
-    parts.push(`${request.vibe.toLowerCase()} vibe`);
+function buildDescription(candidate: EnrichedCandidate): string {
+  switch (candidate.place.primaryType) {
+    case "restaurant":
+      return "A full-service spot that works well for a sit-down date with room to settle in.";
+    case "cafe":
+    case "coffee_shop":
+      return "A cafe-style stop for coffee, conversation, and an easy start or mid-date pause.";
+    case "bar":
+    case "wine_bar":
+    case "pub":
+      return "A drinks-forward spot with a social atmosphere that works well for conversation.";
+    case "bakery":
+    case "dessert_shop":
+      return "A dessert stop for a sweet, low-pressure date break.";
+    case "museum":
+      return "A museum-style outing with exhibits and space to wander together.";
+    case "art_gallery":
+      return "A gallery-style stop built around visual art, browsing, and conversation.";
+    case "movie_theater":
+      return "A movie outing with a built-in shared experience and an easy next stop afterward.";
+    case "performing_arts_theater":
+      return "A live performance venue for a more event-like date night.";
+    case "park":
+      return "An outdoor walk-and-talk setting with room to wander and keep the plan flexible.";
+    case "botanical_garden":
+      return "A scenic garden setting for a slower-paced date with plenty to look at together.";
+    case "tourist_attraction":
+      return "A destination-style stop that turns the date into more of an outing.";
+    case "amusement_park":
+      return "A high-energy outing built around rides, movement, and playful momentum.";
+    case "book_store":
+      return "A browse-and-chat stop that works well for a quieter, more curious date.";
+    default:
+      return buildCategoryFallbackDescription(candidate.profile.category);
   }
+}
+
+function buildCategoryFallbackDescription(category: VenueCategory): string {
+  switch (category) {
+    case "Food":
+      return "A food-and-drink stop that supports an easy conversation-focused date.";
+    case "Bar":
+      return "A social drinks spot that works well for a casual date night.";
+    case "Museum":
+      return "A culture-focused stop with enough structure to make the date feel easy.";
+    case "Nature":
+      return "An outdoor setting that gives the date room to move and feel less formal.";
+    case "Experience":
+      return "An activity-style stop that makes the date feel more like an outing.";
+    case "Shopping":
+      return "A browseable stop that works best when the date is light and curious.";
+    case "Unknown":
+      return "A local option inside your current search area.";
+  }
+}
+
+function buildMatchExplanation(candidate: EnrichedCandidate, request: VenueSearchRequest): string | undefined {
+  const parts: string[] = [];
 
   if (candidate.profile.environment === request.environment) {
     parts.push(`${request.environment} fit`);
-  } else if (candidate.profile.environment === "mixed") {
-    parts.push("mixed setting");
-  } else if (candidate.profile.environment !== "unknown") {
-    parts.push(`${candidate.profile.environment} setting`);
   }
 
   if (candidate.openStatus === "open") {
@@ -413,12 +462,10 @@ function buildSummary(candidate: EnrichedCandidate, request: VenueSearchRequest)
   }
 
   if (parts.length === 0) {
-    return "Local option inside your current search area.";
+    return undefined;
   }
 
-  const first = parts[0]!;
-  const rest = parts.slice(1);
-  return `${capitalize(first)}${rest.length > 0 ? `, ${rest.join(", ")}` : ""}.`;
+  return `Why it matches: ${parts.join(", ")}.`;
 }
 
 function formatBudgetPhrase(tier: BudgetTier): string {

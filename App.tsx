@@ -108,7 +108,7 @@ const FONT = Platform.select({
 
 const TIME_OPTIONS: Record<TimeKey, TimeOption> = {
   quick: { label: "Quick", subLabel: "~90 min", maxMinutes: 100 },
-  standard: { label: "Evening", subLabel: "~3.5 hrs", maxMinutes: 220 },
+  standard: { label: "Settle in", subLabel: "~3.5 hrs", maxMinutes: 220 },
   linger: { label: "Linger", subLabel: "~5 hrs", maxMinutes: 320 }
 };
 
@@ -1307,7 +1307,25 @@ export default function App() {
 
                 <Text style={styles.ideaTitle}>{venue.name}</Text>
                 <Text style={styles.ideaVenue}>{venue.address}</Text>
-                <Text style={styles.ideaBlurb}>{venue.summary}</Text>
+                <Text style={styles.ideaBlurb}>{venue.description}</Text>
+
+                <View style={styles.vibeRow}>
+                  <Text style={styles.vibeLabel}>Feels like:</Text>
+                  {venue.vibes.map((vibe) => {
+                    const isSelectedVibe = vibe === selectedVibe;
+
+                    return (
+                      <View
+                        key={`${venue.id}-${vibe}`}
+                        style={[styles.vibeChip, isSelectedVibe && styles.vibeChipSelected]}
+                      >
+                        <Text style={[styles.vibeChipText, isSelectedVibe && styles.vibeChipTextSelected]}>{vibe}</Text>
+                      </View>
+                    );
+                  })}
+                </View>
+
+                {venue.matchExplanation ? <Text style={styles.matchExplanation}>{venue.matchExplanation}</Text> : null}
 
                 <View style={styles.metaRow}>
                   {metaItems.map((item, itemIndex) => (
@@ -2070,6 +2088,45 @@ const styles = StyleSheet.create({
     color: PALETTE.mutedInk,
     fontSize: 13,
     lineHeight: 18,
+    fontFamily: FONT?.body
+  },
+  vibeRow: {
+    marginTop: 9,
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 6
+  },
+  vibeLabel: {
+    color: PALETTE.deep,
+    fontSize: 11,
+    fontFamily: FONT?.subtitle
+  },
+  vibeChip: {
+    borderRadius: 999,
+    borderWidth: 1,
+    borderColor: "rgba(29, 53, 87, 0.14)",
+    backgroundColor: "rgba(255, 255, 255, 0.42)",
+    paddingHorizontal: 8,
+    paddingVertical: 4
+  },
+  vibeChipSelected: {
+    backgroundColor: "rgba(188, 233, 223, 0.72)",
+    borderColor: "rgba(29, 53, 87, 0.16)"
+  },
+  vibeChipText: {
+    color: PALETTE.deep,
+    fontSize: 11,
+    fontFamily: FONT?.subtitle
+  },
+  vibeChipTextSelected: {
+    color: PALETTE.ink
+  },
+  matchExplanation: {
+    marginTop: 8,
+    color: PALETTE.mutedInk,
+    fontSize: 12,
+    lineHeight: 17,
     fontFamily: FONT?.body
   },
   metaRow: {

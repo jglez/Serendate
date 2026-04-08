@@ -70,7 +70,8 @@ export interface VenueSummary {
   rating?: number;
   ratingCount?: number;
   openStatus?: VenueOpenStatus;
-  summary: string;
+  description: string;
+  matchExplanation?: string;
 }
 
 export interface VenueSearchRequest {
