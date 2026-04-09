@@ -30,6 +30,7 @@ import {
   type Vibe
 } from "./shared/contracts";
 import { searchAreas, searchVenues } from "./serendateApi";
+import { loadSavedVenues, saveSavedVenues } from "./savedVenuesStorage";
 
 type TabKey = "Discover" | "Plan" | "Saved";
 type TimeKey = TimeCommitment;
@@ -343,6 +344,27 @@ function formatVenueEnvironment(environment: VenueSummary["environment"]): strin
   }
 }
 
+function buildVenueMetaItems(venue: VenueSummary): string[] {
+  const metaItems: string[] = [];
+
+  if (venue.priceTier) {
+    metaItems.push(formatBudgetRange(venue.priceTier));
+  }
+
+  if (venue.rating !== undefined) {
+    metaItems.push(`${venue.rating.toFixed(1)}★`);
+  }
+
+  if (venue.openStatus === "open") {
+    metaItems.push("Open at your time");
+  }
+
+  metaItems.push(formatVenueEnvironment(venue.environment));
+  metaItems.push(`${venue.distanceMiles.toFixed(1)} mi`);
+
+  return metaItems;
+}
+
 function getRoundedNow(stepMinutes: number): Date {
   const now = new Date();
   now.setSeconds(0, 0);
@@ -484,7 +506,8 @@ export default function App() {
   const [minPlanningDate, setMinPlanningDate] = useState<Date>(() => getRoundedNow(TIME_STEP_MINUTES));
   const [preferOutdoor, setPreferOutdoor] = useState(false);
   const [selectedRadiusMiles, setSelectedRadiusMiles] = useState(3.5);
-  const [savedIds, setSavedIds] = useState<string[]>(["vinyl-wine", "night-museum"]);
+  const [savedVenues, setSavedVenues] = useState<VenueSummary[]>([]);
+  const [hasHydratedSavedVenues, setHasHydratedSavedVenues] = useState(false);
   const [planSeed, setPlanSeed] = useState(0);
 
   const [currentLocationState, setCurrentLocationState] = useState<CurrentLocationState>("loading");
@@ -538,10 +561,7 @@ export default function App() {
     }).sort((left, right) => left.distanceMiles - right.distanceMiles);
   }, [preferOutdoor, selectedBudget, selectedRadiusMiles, selectedTime, selectedVibe]);
 
-  const savedIdeas = useMemo(
-    () => IDEAS.filter((idea) => savedIds.includes(idea.id)),
-    [savedIds]
-  );
+  const savedVenueIds = useMemo(() => new Set(savedVenues.map((venue) => venue.id)), [savedVenues]);
 
   const maxPlanningDate = useMemo(() => getMaxPlanningDate(minPlanningDate), [minPlanningDate]);
 
@@ -825,6 +845,32 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    let isCancelled = false;
+
+    const hydrateSavedVenues = async () => {
+      const storedVenues = await loadSavedVenues();
+      if (isCancelled) {
+        return;
+      }
+
+      setSavedVenues((current) => {
+        if (current.length === 0) {
+          return storedVenues;
+        }
+
+        return current.concat(storedVenues.filter((venue) => !current.some((savedVenue) => savedVenue.id === venue.id)));
+      });
+      setHasHydratedSavedVenues(true);
+    };
+
+    void hydrateSavedVenues();
+
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (activePicker === "none") {
       return;
     }
@@ -866,7 +912,7 @@ export default function App() {
     } else if (activeTab === "Plan") {
       count = itinerary.length > 0 ? itinerary.length : 1;
     } else {
-      count = savedIdeas.length > 0 ? savedIdeas.length : 1;
+      count = savedVenues.length > 0 ? savedVenues.length : 1;
     }
 
     animatedValues.forEach((value) => value.setValue(0));
@@ -881,7 +927,7 @@ export default function App() {
         })
       )
     ).start();
-  }, [activeTab, animatedValues, discoverVenues.length, itinerary.length, savedIdeas.length]);
+  }, [activeTab, animatedValues, discoverVenues.length, itinerary.length, savedVenues.length]);
 
   useEffect(() => {
     return () => {
@@ -891,11 +937,18 @@ export default function App() {
     };
   }, []);
 
-  const toggleSaved = (id: string) => {
-    setSavedIds((current) =>
-      current.includes(id) ? current.filter((savedId) => savedId !== id) : [id, ...current]
-    );
-  };
+  const toggleSavedVenue = useCallback((venue: VenueSummary) => {
+    setSavedVenues((current) => {
+      const alreadySaved = current.some((savedVenue) => savedVenue.id === venue.id);
+      const nextSavedVenues = alreadySaved
+        ? current.filter((savedVenue) => savedVenue.id !== venue.id)
+        : [{ ...venue, vibes: [...venue.vibes] }, ...current.filter((savedVenue) => savedVenue.id !== venue.id)];
+
+      void saveSavedVenues(nextSavedVenues);
+
+      return nextSavedVenues;
+    });
+  }, []);
 
   const handleTabChange = (tab: TabKey) => {
     const isAlreadyShown = pendingTab === null && tab === activeTab;
@@ -1277,18 +1330,8 @@ export default function App() {
         </Animated.View>
       ) : (
         discoverVenues.map((venue, index) => {
-          const metaItems: string[] = [];
-          if (venue.priceTier) {
-            metaItems.push(formatBudgetRange(venue.priceTier));
-          }
-          if (venue.rating !== undefined) {
-            metaItems.push(`${venue.rating.toFixed(1)}★`);
-          }
-          if (venue.openStatus === "open") {
-            metaItems.push("Open at your time");
-          }
-          metaItems.push(formatVenueEnvironment(venue.environment));
-          metaItems.push(`${venue.distanceMiles.toFixed(1)} mi`);
+          const metaItems = buildVenueMetaItems(venue);
+          const isSaved = savedVenueIds.has(venue.id);
 
           return (
             <Animated.View key={venue.id} style={[styles.cardWrap, animatedStyle(animatedValues[index]!)]}>
@@ -1298,11 +1341,20 @@ export default function App() {
                     <Ionicons name={CATEGORY_ICON[venue.category]} size={14} color={PALETTE.deep} />
                     <Text style={styles.ideaBadgeText}>{venue.category}</Text>
                   </View>
-                  {venue.openStatus === "open" ? (
-                    <View style={styles.statusPill}>
-                      <Text style={styles.statusPillText}>Open</Text>
-                    </View>
-                  ) : null}
+                  <View style={styles.ideaActions}>
+                    {venue.openStatus === "open" ? (
+                      <View style={styles.statusPill}>
+                        <Text style={styles.statusPillText}>Open</Text>
+                      </View>
+                    ) : null}
+                    <Pressable style={styles.saveButton} onPress={() => toggleSavedVenue(venue)}>
+                      <Ionicons
+                        name={isSaved ? "heart" : "heart-outline"}
+                        size={19}
+                        color={isSaved ? PALETTE.coral : PALETTE.deep}
+                      />
+                    </Pressable>
+                  </View>
                 </View>
 
                 <Text style={styles.ideaTitle}>{venue.name}</Text>
@@ -1380,42 +1432,69 @@ export default function App() {
 
   const SavedTab = (
     <View style={styles.tabBody}>
-      <Text style={styles.tabIntro}>Your bookmarked mock ideas for quick planning later.</Text>
+      <Text style={styles.tabIntro}>Your bookmarked venues for easy access.</Text>
 
-      {savedIdeas.length === 0 ? (
+      {!hasHydratedSavedVenues ? (
+        <Animated.View style={[styles.emptyState, animatedStyle(animatedValues[0]!)]}>
+          <ActivityIndicator size="small" color={PALETTE.deep} />
+          <Text style={styles.emptyTitle}>Loading saved venues</Text>
+          <Text style={styles.emptyBody}>We are restoring the places you bookmarked on this device.</Text>
+        </Animated.View>
+      ) : savedVenues.length === 0 ? (
         <Animated.View style={[styles.emptyState, animatedStyle(animatedValues[0]!)]}>
           <Ionicons name="heart-dislike-outline" size={26} color={PALETTE.deep} />
           <Text style={styles.emptyTitle}>Nothing saved yet</Text>
-          <Text style={styles.emptyBody}>Tap hearts in your mock shortlist below to build it out.</Text>
+          <Text style={styles.emptyBody}>Tap hearts on the Discover tab to save your favorite venues.</Text>
         </Animated.View>
       ) : (
-        savedIdeas.map((idea, index) => (
-          <Animated.View key={idea.id} style={[styles.cardWrap, animatedStyle(animatedValues[index]!)]}>
-            <LinearGradient colors={[PALETTE.panelStrong, PALETTE.panel]} style={styles.ideaCard}>
-              <View style={styles.ideaTopRow}>
-                <View style={styles.ideaBadge}>
-                  <Ionicons name={CATEGORY_ICON[idea.category]} size={14} color={PALETTE.deep} />
-                  <Text style={styles.ideaBadgeText}>{idea.category}</Text>
+        savedVenues.map((venue, index) => {
+          const metaItems = buildVenueMetaItems(venue);
+
+          return (
+            <Animated.View key={venue.id} style={[styles.cardWrap, animatedStyle(animatedValues[index]!)]}>
+              <LinearGradient colors={[PALETTE.panelStrong, PALETTE.panel]} style={styles.ideaCard}>
+                <View style={styles.ideaTopRow}>
+                  <View style={styles.ideaBadge}>
+                    <Ionicons name={CATEGORY_ICON[venue.category]} size={14} color={PALETTE.deep} />
+                    <Text style={styles.ideaBadgeText}>{venue.category}</Text>
+                  </View>
+                  <View style={styles.ideaActions}>
+                    {venue.openStatus === "open" ? (
+                      <View style={styles.statusPill}>
+                        <Text style={styles.statusPillText}>Open</Text>
+                      </View>
+                    ) : null}
+                    <Pressable style={styles.saveButton} onPress={() => toggleSavedVenue(venue)}>
+                      <Ionicons name="heart" size={19} color={PALETTE.coral} />
+                    </Pressable>
+                  </View>
                 </View>
-                <Pressable style={styles.saveButton} onPress={() => toggleSaved(idea.id)}>
-                  <Ionicons name="heart" size={19} color={PALETTE.coral} />
-                </Pressable>
-              </View>
 
-              <Text style={styles.ideaTitle}>{idea.title}</Text>
-              <Text style={styles.ideaVenue}>{idea.venue + " · " + idea.neighborhood}</Text>
-              <Text style={styles.ideaBlurb}>{idea.blurb}</Text>
+                <Text style={styles.ideaTitle}>{venue.name}</Text>
+                <Text style={styles.ideaVenue}>{venue.address}</Text>
+                <Text style={styles.ideaBlurb}>{venue.description}</Text>
 
-              <View style={styles.metaRow}>
-                <Text style={styles.metaText}>{formatBudgetRange(idea.cost)}</Text>
-                <Text style={styles.metaDot}>•</Text>
-                <Text style={styles.metaText}>{formatMinutes(idea.durationMinutes)}</Text>
-                <Text style={styles.metaDot}>•</Text>
-                <Text style={styles.metaText}>{idea.indoor ? "Indoor" : "Outdoor"}</Text>
-              </View>
-            </LinearGradient>
-          </Animated.View>
-        ))
+                <View style={styles.vibeRow}>
+                  <Text style={styles.vibeLabel}>Feels like:</Text>
+                  {venue.vibes.map((vibe) => (
+                    <View key={`${venue.id}-${vibe}`} style={styles.vibeChip}>
+                      <Text style={styles.vibeChipText}>{vibe}</Text>
+                    </View>
+                  ))}
+                </View>
+
+                <View style={styles.metaRow}>
+                  {metaItems.map((item, itemIndex) => (
+                    <React.Fragment key={`${venue.id}-${item}`}>
+                      {itemIndex > 0 ? <Text style={styles.metaDot}>•</Text> : null}
+                      <Text style={styles.metaText}>{item}</Text>
+                    </React.Fragment>
+                  ))}
+                </View>
+              </LinearGradient>
+            </Animated.View>
+          );
+        })
       )}
     </View>
   );
@@ -2032,6 +2111,11 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     alignItems: "center",
     marginBottom: 8
+  },
+  ideaActions: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8
   },
   ideaBadge: {
     flexDirection: "row",
